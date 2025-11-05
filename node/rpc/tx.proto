@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+option go_package = "./rpc";
+
+message TxSignReq {
+  string From = 1;
+  string To = 2;
+  uint64 Value = 3;
+  string Password = 4;
+}
+
+message TxSignRes {
+  bytes Tx = 1;
+}
+
+message TxSendReq {
+  bytes Tx = 1;
+}
+
+message TxSendRes {
+  string Hash = 1;
+}
+
+message TxReceiveReq {
+  bytes Tx = 1;
+}
+
+message TxReceiveRes { }
+
+message TxSearchReq {
+  string Hash = 1;
+  string From = 2;
+  string To = 3;
+  string Account = 4;
+}
+
+message TxSearchRes {
+  bytes Tx = 1;
+}
+
+message TxProveReq {
+  string Hash = 1;
+}
+
+message TxProveRes {
+  bytes MerkleProof = 1;
+}
+
+message TxVerifyReq {
+  string Hash = 1;
+  bytes MerkleProof = 2;
+  string MerkleRoot = 3;
+}
+
+message TxVerifyRes {
+  bool Valid = 1;
+}
+
+service Tx {
+  rpc TxSign(TxSignReq) returns (TxSignRes);
+  rpc TxSend(TxSendReq) returns (TxSendRes);
+  rpc TxReceive(stream TxReceiveReq) returns (TxReceiveRes);
+  rpc TxSearch(TxSearchReq) returns (stream TxSearchRes);
+  rpc TxProve(TxProveReq) returns (TxProveRes);
+  rpc TxVerify(TxVerifyReq) returns (TxVerifyRes);
+}

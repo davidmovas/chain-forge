@@ -1,0 +1,529 @@
+* Account
+:PROPERTIES:
+:TOC: :include descendants
+:END:
+
+:CONTENTS:
+- [[#concepts-and-purpose][Concepts and purpose]]
+  - [[#blockchain-account][Blockchain account]]
+  - [[#private-key-and-public-key][Private key and public key]]
+- [[#design-and-implementation][Design and implementation]]
+  - [[#secp256k1-key-pair][Secp256k1 key pair]]
+  - [[#account-address-with-keccak256-hash-function][Account address with Keccak256 hash function]]
+  - [[#account-with-secp256k1-key-pair][Account with Secp256k1 key pair]]
+  - [[#aes-gcm-encryption-with-argon2-kdf-of-secp256k1-key-pair][AES-GCM encryption with Argon2 KDF of Secp256k1 key pair]]
+  - [[#grpc-accountcreate-method][gRPC AccountCreate method]]
+  - [[#grpc-accountbalance-method][gRPC AccountBalance method]]
+- [[#testing-and-usage][Testing and usage]]
+  - [[#testing-account-persistence-and-re-creation][Testing account persistence and re-creation]]
+  - [[#testing-grpc-accountcreate-method][Testing gRPC AccountCreate method]]
+  - [[#testing-grpc-accountbalance-method][Testing gRPC AccountBalance method]]
+  - [[#initializing-and-starting-the-bootstrap-node][Initializing and starting the bootstrap node]]
+  - [[#using-account-create-cli-command][Using account create CLI command]]
+  - [[#using-account-balance-cli-command][Using account balance CLI command]]
+:END:
+
+** Concepts and purpose
+
+*** Blockchain account
+
+- Blockchain account :: The blockchain account represents a digital identity on
+  the blockchain. The blockchain account represents user's ownership of assets
+  on the blockchain. The blockchain account can hold, send, and receive
+  cryptocurrency and tokens. The blockchain account has the associated digital
+  ledger of debit and credit transactions and the current balance of the
+  account. The account components
+  - Private key :: The private key is a large randomly generated secret number
+    used to control assets on the blockchain by signing transactions that spend
+    funds from the account
+  - Account address :: The Account address is a hash of the public key, derived
+    from the corresponding private key, that uniquely identifies the account on
+    the blockchain
+  - Account balance :: The account balance is the amount of divisible
+    cryptocurrency or indivisible tokens controlled by the private key of the
+    account
+  - Account transactions :: The account transactions is a time-ordered list of
+    debit and credit transactions involving the account
+  Account operations
+  - Create account :: The create account operation derives the public address
+    and stores the password-protected private key
+  - Sign transaction :: The sign transaction operation creates a digital
+    signature of the transaction with the private key of the signing account
+  - Verify transaction :: The verify transaction signature operation recovers
+    the public key of the signing account from the hash of the encoded
+    transaction and the transaction signature, derives the public address from
+    the recovered public key, and compares the derived public address with the
+    account address of the signing account
+  - Check account balance :: The check account balance operation gets the
+    current balance of the account from the confirmed state of the blockchain
+  - List account transactions :: The list account transactions operation
+    enumerates all debit and credit transactions involving the account
+
+*** Private key and public key
+
+The account on the blockchain is represented by a key pair that consist of a
+private key and a public key
+
+- Private key :: The private key is a large randomly generated secret number
+  that is used to derive the public key and digitally sign transactions. The
+  private key must be kept in secret to preserve account authenticity and
+  control account assets on the blockchain
+- Public key :: The public key is a pair of large numbers derived from the
+  private key. The public key is used to identify the account on the blockchain
+  and verify transactions signed with the account private key. The public key
+  can be safely shared with any participant on the blockchain
+
+** Design and implementation
+
+*** Secp256k1 key pair
+
+The implementation of this blockchain uses the Elliptic-Curve Cryptography
+(ECC). Specifically, the Secp256k1 elliptic curve is used for generation of
+key pairs for accounts on the blockchain, as well as signing and verification of
+transactions on the blockchain
+
+- Secp256k1 public key :: The public key holds the name =P-256k1= of the
+  elliptic curve and two large numbers =X= and =Y= derived from the
+  corresponding private key
+  | ~Curve string~  | Secp256k1 curve name. Always =P-256k1= |
+  | ~X, Y *big.int~ | Two large derived numbers              |
+  #+BEGIN_SRC go
+type p256k1PublicKey struct {
+  Curve string `json:"curve"`
+  X *big.Int `json:"x"`
+  Y *big.Int `json:"y"`
+}
+
+func newP256k1PublicKey(pub *ecdsa.PublicKey) p256k1PublicKey {
+  return p256k1PublicKey{Curve: "P-256k1", X: pub.X, Y: pub.Y}
+}
+  #+END_SRC
+- Secp256k1 private key :: The private key holds the large random secret number
+  =D= and embeds the derived public key =p256k1PublicKey=. The
+  ~*ecdsa.PublicKey~ and the =*ecdsa.PrivateKey= keys can be retrieved from the
+  =p256k1PrivateKey= instance
+  | ~p256k1PublicKey~ | Embedded public key        |
+  | ~D *big.Int~      | Large random secret number |
+  #+BEGIN_SRC go
+type p256k1PrivateKey struct {
+  p256k1PublicKey
+  D *big.Int `json:"d"`
+}
+
+func newP256k1PrivateKey(prv *ecdsa.PrivateKey) p256k1PrivateKey {
+  return p256k1PrivateKey{
+    p256k1PublicKey: newP256k1PublicKey(&prv.PublicKey), D: prv.D,
+  }
+}
+
+func (k *p256k1PrivateKey) publicKey() *ecdsa.PublicKey {
+  return &ecdsa.PublicKey{Curve: ecc.P256k1(), X: k.X, Y: k.Y}
+}
+
+func (k *p256k1PrivateKey) privateKey() *ecdsa.PrivateKey {
+  return &ecdsa.PrivateKey{PublicKey: *k.publicKey(), D: k.D}
+}
+  #+END_SRC
+
+The =p256k1PublicKey= and =p256k1PrivateKey= types are used for JSON encoding
+and decoding of Secp256k1 private and public keys, which, in turn, is used for
+persistence and re-creation of accounts on the blockchain
+
+*** Account address with Keccak256 hash function
+
+- Account address :: The account address uniquely identifies an account on the
+  blockchain and can be safely shared with any participant on the blockchain.
+  The account address is the Keccak256 hash of the encoded public key associated
+  with the account. The account address is implemented as a type alias to a
+  string. The account address is calculated from a =*ecdsa.PublicKey=
+  #+BEGIN_SRC go
+type Address string
+
+func NewAddress(pub *ecdsa.PublicKey) Address {
+  jpub, _ := json.Marshal(newP256k1PublicKey(pub))
+  hash := make([]byte, 64)
+  sha3.ShakeSum256(hash, jpub)
+  return Address(hex.EncodeToString(hash[:32]))
+}
+  #+END_SRC
+
+*** Account with Secp256k1 key pair
+
+- Account :: The account contains the Secp256k1 private key and the account
+  address derived from the corresponding Secp256k1 public key using the
+  Keccak256 hash function. A new Secp256k1 key pair is generated when a new
+  account is created
+  | ~prv *ecdsa.PrivateKey~ | Secp256k1 private key   |
+  | ~addr Address~          | Derived account address |
+  #+BEGIN_SRC go
+type Account struct {
+  prv *ecdsa.PrivateKey
+  addr Address // derived
+}
+
+func NewAccount() (Account, error) {
+  prv, err := ecdsa.GenerateKey(ecc.P256k1(), rand.Reader)
+  if err != nil {
+    return Account{}, err
+  }
+  addr := NewAddress(&prv.PublicKey)
+  return Account{prv: prv, addr: addr}, nil
+}
+  #+END_SRC
+
+The private key is the only piece of information required to re-create an
+account after persisting the account to an encrypted file protected with the
+owner-provided password. Accounts on this blockchain are persisted to files with
+restricted access. The encoded key pair of the account is encrypted with the
+owner-provided password before being persisted to a file with restricted access.
+Only the owner of the account can re-create the account and use the account to
+sign transactions by providing the correct password to decrypt the account key
+pair
+
+- Account persistence :: The account persistence process
+  - Encode the account key pair
+  - Encrypt the encoded key pair with the owner-provided password
+  - Write the encrypted key pair to a file with restricted access
+  #+BEGIN_SRC go
+func (a Account) Write(dir string, pass []byte) error {
+  jprv, err := a.encodePrivateKey()
+  if err != nil {
+    return err
+  }
+  cprv, err := encryptWithPassword(jprv, pass)
+  if err != nil {
+    return err
+  }
+  err = os.MkdirAll(dir, 0700)
+  if err != nil {
+    return err
+  }
+  path := filepath.Join(dir, string(a.Address()))
+  return os.WriteFile(path, cprv, 0600)
+}
+  #+END_SRC
+
+The structure of the encoded key pair before encryption
+#+BEGIN_SRC json
+{
+  "curve": "P-256k1",
+  "x": 76146145399705616720589739763260279141573762368317905858350098027838154138247,
+  "y": 38666865918508785210169373834294899085353404099611077977239116930574874120850,
+  "d": 4551610683346874789776802044583374602892654338372126162371523966290596962565
+}
+#+END_SRC
+
+- Account re-creation :: The account re-creation process
+  - Read the encrypted key pair from a file
+  - Decrypt the encrypted key pair with the owner-provided password
+  - Decode the encoded key pair
+  - Re-create the account from the decoded key pair
+  #+BEGIN_SRC go
+func ReadAccount(path string, pass []byte) (Account, error) {
+  cprv, err := os.ReadFile(path)
+  if err != nil {
+    return Account{}, err
+  }
+  jprv, err := decryptWithPassword(cprv, pass)
+  if err != nil {
+    return Account{}, err
+  }
+  return decodePrivateKey(jprv)
+}
+  #+END_SRC
+
+*** AES-GCM encryption with Argon2 KDF of Secp256k1 key pair
+
+- AES-GCM encryption with Argon2 KDF :: The encryption process
+  - Argon2 Key Derivation Function (KDF) derives a cryptographically strong
+    encryption key from the owner-provided password and a randomly generated
+    salt
+  - Create the AES block cipher that uses the derived cryptographically strong
+    encryption key
+  - Create the AES-GCM encryption mode from the AES block cipher
+  - AES-GCM encrypts the encoded key pair with a randomly generated nonce
+  - Pack the random salt, the random nonce, and the ciphertext all together into
+    a slice of bytes to be written to a file. Both the random salt for the
+    Argon2 KDF and the random nonce for the AES-GCM encryption are public, but
+    must be unique
+  #+BEGIN_SRC go
+func encryptWithPassword(msg, pass []byte) ([]byte, error) {
+  salt := make([]byte, encKeyLen)
+  _, err := rand.Read(salt)
+  if err != nil {
+    return nil, err
+  }
+  key := argon2.IDKey(pass, salt, 1, 256, 1, encKeyLen)
+  blk, err := aes.NewCipher(key)
+  if err != nil {
+    return nil, err
+  }
+  gcm, err := cipher.NewGCM(blk)
+  if err != nil {
+    return nil, err
+  }
+  nonce := make([]byte, gcm.NonceSize())
+  _, err = rand.Read(nonce)
+  if err != nil {
+    return nil, err
+  }
+  ciph := gcm.Seal(nonce, nonce, msg, nil)
+  ciph = append(salt, ciph...)
+  return ciph, nil
+}
+  #+END_SRC
+
+- AES-GCM decryption with Argon2 KDF :: The decryption process
+  - Argon2 KDF derives the encryption key from the owner-provided password and
+    the random salt extracted from the ciphertext
+  - Create the AES block cipher that uses the derived cryptographically strong
+    encryption key
+  - Create the AES-GCM encryption mode from the AES block cipher
+  - AES-GCM decrypts the encoded key pair using the ciphertext and the random
+    nonce extracted from the ciphertext
+  #+BEGIN_SRC go
+func decryptWithPassword(ciph, pass []byte) ([]byte, error) {
+  salt, ciph := ciph[:encKeyLen], ciph[encKeyLen:]
+  key := argon2.IDKey(pass, salt, 1, 256, 1, encKeyLen)
+  blk, err := aes.NewCipher(key)
+  if err != nil {
+    return nil, err
+  }
+  gcm, err := cipher.NewGCM(blk)
+  if err != nil {
+    return nil, err
+  }
+  nonceLen := gcm.NonceSize()
+  nonce, ciph := ciph[:nonceLen], ciph[nonceLen:]
+  msg, err := gcm.Open(nil, nonce, ciph, nil)
+  if err != nil {
+    return nil, err
+  }
+  return msg, nil
+}
+  #+END_SRC
+
+*** gRPC =AccountCreate= method
+
+The gRPC =Account= service provides the =AccountCreate= method to create and
+persist new accounts to the local key store of the blockchain node. The
+interface of the service
+#+BEGIN_SRC protobuf
+message AccountCreateReq {
+  string Password = 1;
+}
+
+message AccountCreateRes {
+  string Address = 1;
+}
+
+service Account {
+  rpc AccountCreate(AccountCreateReq) returns (AccountCreateRes);
+}
+#+END_SRC
+
+The implementation of the =AccountCreate= method
+- Validate the owner-provided password
+- Create a new account by generating the account key pair
+- Persist the generated account key pair to the local key store of the node
+#+BEGIN_SRC go
+func (s *AccountSrv) AccountCreate(
+  _ context.Context, req *AccountCreateReq,
+) (*AccountCreateRes, error) {
+  pass := []byte(req.Password)
+  if len(pass) < 5 {
+    return nil, status.Errorf(
+      codes.InvalidArgument, "password length is less than 5",
+    )
+  }
+  acc, err := chain.NewAccount()
+  if err != nil {
+    return nil, status.Errorf(codes.Internal , err.Error())
+  }
+  err = acc.Write(s.keyStoreDir, pass)
+  if err != nil {
+    return nil, status.Errorf(codes.Internal, err.Error())
+  }
+  res := &AccountCreateRes{Address: string(acc.Address())}
+  return res, nil
+}
+#+END_SRC
+
+*** gRPC =AccountBalance= method
+
+The gRPC =Account= service provides the =AccountBalance= method to check the
+balance of an account from the confirmed state of the blockchain node. The
+interface of the service
+#+BEGIN_SRC protobuf
+message AccountBalanceReq {
+  string Address = 1;
+}
+
+message AccountBalanceRes {
+  uint64 Balance = 1;
+}
+
+service Account {
+  rpc AccountBalance(AccountBalanceReq) returns (AccountBalanceRes);
+}
+#+END_SRC
+
+The implementation of the =AccountBalance= method
+- Check the balance of the requested account address if the balance entry exists
+  in the confirmed state of the blockchain node. An account can be created, but
+  the balance entry in the confirmed state will be included only after the first
+  transaction involving the account is validated and confirmed on the blockchain
+#+BEGIN_SRC go
+func (s *AccountSrv) AccountBalance(
+  _ context.Context, req *AccountBalanceReq,
+) (*AccountBalanceRes, error) {
+  acc := req.Address
+  balance, exist := s.balChecker.Balance(chain.Address(acc))
+  if !exist {
+    return nil, status.Errorf(
+      codes.NotFound, fmt.Sprintf(
+        "account %v does not exist or has not yet transacted", acc,
+      ),
+    )
+  }
+  res := &AccountBalanceRes{Balance: balance}
+  return res, nil
+}
+#+END_SRC
+
+** Testing and usage
+
+*** Testing account persistence and re-creation
+
+The =TestAccountWriteReadSignTxVerifyTx= testing process
+- Create a new account
+- Persist the new account
+- Re-create the persisted account
+- Create and sign a transaction
+- Verify that the signature of the signed transaction is valid
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run AccountWriteRead
+#+END_SRC
+
+*** Testing gRPC =AccountCreate= method
+
+The =TestAccountCreate= testing process
+- Set up the gRPC server and client
+- Create the gRPC account client
+- Call the =AccountCrate= method to create and persist a new account
+- Verify that the created account can be read from the local key store
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run AccountCreate
+#+END_SRC
+
+*** Testing gRPC =AccountBalance= method
+
+The =TestAccountBalance= testing process
+- Create and persist the genesis
+- Create the state from the genesis
+- Get the initial owner account and its balance from the genesis
+- Set up the gRPC server and client
+- Create the gRPC account client
+- Check the balance of an existing account
+  - Call the =AccountBalance= method to get the balance of an existing account
+  - Verify that balance is correct
+- Check the balance of a non-existing account
+  - Call the =AccountBalance= method to get the balance of a non-existing
+    account
+  - Verify that the correct error is returned
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run AccountBalance
+#+END_SRC
+
+*** Initializing and starting the bootstrap node
+
+The blockchain node in this blockchain consists of the in-memory confirmed and
+pending state that holds confirmed balances and nonces of all accounts, the
+reference to the last confirmed block, and that list of pending transactions
+sent by clients or relayed by other nodes that are not yet validated and packed
+into a confirmed block. Each proposed block is validated, and, if successful,
+the confirmed block is immediately appended to the local block store on every
+node. The blockchain node manages the blockchain state and interactions with
+other nodes connected through the peer-to-peer network. All interactions between
+blockchain nodes and with clients are performed at any blockchain node through
+the gRPC interface. A single blockchain node is autonomous, self-contained, and
+provides the same set of gRPC services as any other node on the peer-to-peer
+blockchain network. In this blockchain there is the single bootstrap and
+authority node. The bootstrap node serves as the seed node for other nodes
+during the initial peer discovery. The authority node signs the genesis and
+creates, signs, and proposes blocks on the blockchain to be validated by all
+other nodes on the blockchain including the authority node itself
+
+- Bootstrap and authority node initialization :: The parameters to initialize
+  the bootstrap node and the authority node
+  - =--node= specifies the node address
+  - =--bootstrap= makes the node the bootstrap node for the initial peer
+    discovery, and also makes the node the authority node for signing the
+    genesis, proposing and signing new blocks
+  - =--authpass= provides a password for the authority account to sign the
+    genesis and proposed blocks on the blockchain
+  - =--ownerpass= provides a password for the initial owner account on the
+    blockchain
+  - =--balance= specifies the balance for the initial owner account on the
+    blockchain
+  Initialize the bootstrap node and the authority node
+#+BEGIN_SRC fish
+set boot localhost:1122
+set authpass password
+set ownerpass password
+rm -rf .keystore* .blockstore* # cleanup if necessary
+./bcn node start --node $boot --bootstrap --authpass $authpass \
+  --ownerpass $ownerpass --balance 1000
+#+END_SRC
+
+- Bootstrap and authority node start :: Start the already initialized bootstrap
+  and authority node
+#+BEGIN_SRC fish
+./bcn node start --node $boot --bootstrap --authpass $authpass
+#+END_SRC
+
+*** Using =account create= CLI command
+
+The gRPC =AccountCreate= method is exposed through the CLI. Create and persist a
+new account on the local key store of the blockchain node
+- Start the bootstrap node
+  #+BEGIN_SRC fish
+./bcn node start --node $boot --bootstrap --authpass $authpass
+  #+END_SRC
+- Create and persist a new account to the local key store of the bootstrap node
+  (in a new terminal)
+  - =--node= specifies the node address
+  - =--ownerpass= provides the password for the new account
+  #+BEGIN_SRC fish
+./bcn account create --node $boot --ownerpass $ownerpass
+# acc 596cd4370df451aa9403dddf7febc949fa729eab8f2bdceebbc24477d6f4c80f
+  #+END_SRC
+
+*** Using =account balance= CLI command
+
+The gRPC =AccountBalance= method is exposed through the CLI. Check the balance
+of the initial owner account from the genesis or an account that have already
+transacted on the blockchain
+- Start the bootstrap node
+  #+BEGIN_SRC fish
+./bcn node start --node $boot --bootstrap --authpass $authpass
+  #+END_SRC
+- Get the account address of the initial owner account from the genesis file at
+  =.keystore<port>/genesis.json=
+  #+BEGIN_SRC json
+{
+  "chain": "blockchain",
+  "authority": "f562ef45023a56a62a0a700d4f347affc0b0401dc77ab69cd8b0ac40b9c79249",
+  "balances": {
+    "d54173365ca6c47d482b0a06ba4f196049014145093778427383de19d66a76d7": 1000
+  },
+  "time": "2024-09-28T14:40:34.749369849+02:00",
+  "sig": "yVlFB9LImlegWJ9XzLZ4Wslr+zTWBUQ1hanrzdABShN4KTZeYlc/jQbQerV68EKeqvpf8BmWOdmXhlRXA1wsOAA="
+}
+  #+END_SRC
+- Get the balance of the initial owner account from the genesis
+  #+BEGIN_SRC fish
+set account d54173365ca6c47d482b0a06ba4f196049014145093778427383de19d66a76d7
+./bcn account balance --node $boot --account $account
+# acc d54173365ca6c47d482b0a06ba4f196049014145093778427383de19d66a76d7: 1000
+  #+END_SRC

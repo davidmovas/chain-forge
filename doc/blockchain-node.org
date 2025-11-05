@@ -1,0 +1,626 @@
+* Blockchain node
+:PROPERTIES:
+:TOC: :include descendants
+:END:
+
+:CONTENTS:
+- [[#concepts-and-purpose][Concepts and purpose]]
+  - [[#peer-discovery-and-transaction-relay][Peer discovery and transaction relay]]
+  - [[#block-proposer-block-relay-block-confirmation][Block proposer, block relay, block confirmation]]
+  - [[#confirmed-state-and-pending-state][Confirmed state and pending state]]
+  - [[#streaming-domain-events-to-clients][Streaming domain events to clients]]
+  - [[#the-node-graceful-shutdown-mechanism][The node graceful shutdown mechanism]]
+- [[#design-and-implementation][Design and implementation]]
+  - [[#node-type][Node type]]
+  - [[#starting-the-blockchain-node][Starting the blockchain node]]
+  - [[#the-node-grpc-server][The node gRPC server]]
+  - [[#the-node-cli][The node CLI]]
+- [[#testing-and-usage][Testing and usage]]
+  - [[#testing-the-node-life-cycle][Testing the node life cycle]]
+  - [[#using-the-blockchain-network-with-two-nodes][Using the blockchain network with two nodes]]
+:END:
+
+** Concepts and purpose
+
+*** Peer discovery and transaction relay
+
+- Blockchain node :: The blockchain node is the core component of the blockchain
+  peer-to-peer network. The blockchain peer-to-peer network consists of a set of
+  autonomous, self-contained and interconnected nodes. The set of interconnected
+  nodes forms a distributed system where each node operates independently of
+  other nodes and is interconnected with other nodes through peer-to-peer
+  connections
+- Peer discovery :: The peer-to-peer connections are established automatically
+  through the peer discovery mechanism. The peer discover mechanism starts with
+  the seed node address that is the bootstrap node and periodically fetches the
+  list of known peers from every known peer of a node. This design ensures
+  automatic discovery of new peers that have been recently added to the
+  blockchain and automatic disposition of connections with nodes that have gone
+  offline
+- Transaction relay :: After establishing peer-to-peer connections with other
+  nodes the node starts accepting new signed transactions from the clients. All
+  accepted from clients and validated by the node are automatically relayed to
+  the list of known peers in order to propagate new validated transactions
+  through the peer-to-peer network of nodes. Every node in the peer-to-peer
+  network accumulates relayed validated transaction in the local pending state.
+  The local pending state contains the new validated transactions to be included
+  into the new proposed block
+
+*** Block proposer, block relay, block confirmation
+
+- Block proposer :: The block proposer is part of the consensus algorithm
+  employed by the blockchain. This blockchain uses the Proof of Authority (PoA)
+  centralized consensus. Specifically, in this blockchain only the authority
+  node holds the authority account that signs new proposed blocks. The authority
+  node periodically with a random delay creates new blocks from the validated
+  transactions of the pending state, signs the block with the authority account
+  and relays the signed proposed block to other validators to validate and
+  confirm the proposed blocks. Other validators are all the nodes on this
+  blockchain including the authority node itself. The propagation of the new
+  proposed blocks happens through the block relay
+- Block relay :: After a new block has been created and signed by the authority
+  node, the proposed block is propagated through the peer-to-peer network using
+  the block relay mechanism. The block relay mechanism reuses the infrastructure
+  of the transaction relay with a notable difference that the block relay
+  mechanism uses the self-relay function, while the transaction relay mechanism
+  does not. The self-relay function relays the proposed block to the authority
+  node itself along with the list of known peers. This design separates the
+  block proposal function from the block validation and confirmation function.
+  There is only one block proposer, the authority node, in this blockchain. This
+  design prevents forks on the blockchain as all nodes either confirm a
+  a single proposed and validated block or reject an invalid proposed block
+- Block confirmation :: Each proposed block received through the block relay
+  mechanism is validated against the coned state, and, if successful, is applied
+  to the confirmed state of the node, and is appended to the local block store
+  of the node. The block validation verifies that the proposed block number, the
+  parent hash, and the contained transactions are in accordance with the latest
+  confirmed state maintained on every node. The block validation validates also
+  all transactions from the proposed block against the cloned state. If the
+  proposed blocks is validated, the block becomes confirmed and is applied to
+  the confirmed state, as well as the block is appended to the local block
+  store. The block confirmation concludes the PoA consensus algorithm initiated
+  by the block proposer. This design ensures that all nodes on the peer-to-peer
+  network confirm validated blocks proposed and signed by the authority node in
+  exactly the same order with exactly the same block content
+
+*** Confirmed state and pending state
+
+- State sync :: When a new node joins the peer-to-peer network, or an
+  out-of-sync node becomes online again, the state sync process fetches the
+  genesis from the bootstrap node and fetches all newer confirmed blocks from
+  the list of known peers in order to synchronize the node with latest confirmed
+  state on the blockchain. The state sync process on the bootstrap node is also
+  used when initializing a completely new blockchain. In this case a new genesis
+  is persisted with the initial blockchain configuration including the authority
+  account address, the initial owner account, and the initial owner account
+  balance. The latest blockchain state including both the last confirmed block
+  and the list of pending validated transactions is maintained in the state data
+  structure on every node
+- Confirmed and pending state :: The confirmed and pending state is an in-memory
+  data structure that is maintained on every node in the peer-to-peer network of
+  the blockchain. The confirmed state reflects the account balances after
+  applying in order transactions from confirmed blocks. The confirmed state is
+  regularly updated with state changes from the next confirmed block on the
+  blockchain. The pending state accumulates new validated transactions sent
+  directly to the node by the clients or relayed from other nodes. The list of
+  pending transactions is used to create, sign, and propose the next block by
+  the authority node. The list of pending transactions is updated after the new
+  proposed block is confirmed and applied to the confirmed state and added to
+  the local block store. Specifically, all confirmed transactions are removed
+  from the list of pending transactions
+
+*** Streaming domain events to clients
+
+- Event stream :: The node event stream mechanism publishes important domain
+  events that occur on the blockchain node to be consumed by subscribed clients.
+  The domain events that occur on the node are always available for any client
+  to consume. The client subscribes to the node event stream by specifying the
+  types of event the client is willing to receive. On successful subscription
+  events of all requested event types are delivered to the subscribed client
+  through the gRPC server streaming. At any moment the client can close the
+  streaming without impacting event streaming to other clients subscribed to the
+  same node. The node event stream mechanism provides efficient, real-time
+  notification of external applications about the important domain events that
+  occur on the blockchain e.g. confirmed blocks, confirmed transactions
+
+*** The node graceful shutdown mechanism
+
+- Node graceful shutdown :: The node graceful shutdown mechanism provides a
+  reliable mechanism to notify graceful shutdown to all concurrent processes on
+  the blockchain node and wait for the graceful termination of node concurrent
+  processes before shutting down the node's main goroutine. The node graceful
+  shutdown happens after the node process receives the =SIGINT=, the =SIGTERM=,
+  or the =SIGKILL= signal from the other process on the OS. The node graceful
+  shutdown mechanism contributes to the clean shutdown of the blockchain node.
+  The clean shutdown of the node implies that after receiving the shutdown
+  signal the node stops accepting new connections on the gRPC interface, the
+  node stops accepting new requests on existing active gRPC connections, the
+  node finishes processing all requests that have been in progress when the
+  shutdown signal was received, the node correctly updates the confirmed and the
+  pending state, the node finishes all pending operations on the local block
+  store and closes the local block store, the node stops communication with all
+  connected peers and closes all open connections with active peers. The node
+  graceful shutdown mechanism consists of the node shared context hierarchy that
+  spreads all concurrent node processes that have to be notified about the
+  graceful shutdown. When the node graceful shutdown signal is received, the
+  node shared context hierarchy is canceled. This notifies all concurrent node
+  components that the node graceful shutdown has started. The node graceful
+  shutdown mechanism consists of the shared wait group that spreads all
+  concurrent node processes that have to notify the node about the graceful
+  termination success. When every concurrent node process terminates gracefully,
+  the process notifies the node's main goroutine about the successful
+  termination. The node's main goroutine waits for all node concurrent processes
+  to terminate gracefully, before terminating the node main process
+
+** Design and implementation
+
+*** Node type
+
+- Node type :: The =Node= type hosts all the concurrent node processes required
+  to discover peers; accept, validate, and relay transactions; propose,
+  validate, and relay blocks; apply validated blocks to the confirmed state,
+  append validated blocks to the local block store; stream domain events to
+  subscribed clients; and handle the node graceful shutdown including all
+  concurrent processes. The node type contains the node configuration including
+  the node and seed addresses, the node bootstrap flag, the directories for the
+  local key store and the local block store, the blockchain name, the authority
+  account password, the initial owner account password, the initial owner
+  account balance, the period of concurrent node processes. The node type
+  contains the node shared context hierarchy and the node shared wait group to
+  support the node graceful shutdown mechanism. The node type hosts the node
+  event stream to deliver domain events to subscribed clients. The node type
+  contains the confirmed and pending state, and the state sync to initialize new
+  nodes or synchronize out-of-sync nodes with the latest state updates on the
+  blockchain. The node type hosts the gRPC server for all interactions between
+  the node and other nodes, as well as interactions between the node and the
+  clients. The node type contains the peer discovery to automatically connect
+  the node with other nodes on the peer-to-peer network. The node type contains
+  the transaction relay to propagate validated transaction to the list of known
+  peers. The node type contains the block proposer to periodically create, sign,
+  and propose new blocks with pending transactions. In this blockchain the block
+  proposer is only activated on the authority node. All nodes on the blockchain
+  including the authority node are the validator nodes. The node type contains
+  the block relay to propagate proposed and validated blocks to the list of know
+  peers including the authority node that proposed the new block. The node type
+  acts as an extensible container for node concurrent processes that support
+  correct operations of the node in particular and the blockchain in general.
+  The node graceful shutdown mechanism ensures that all node concurrent
+  processes terminate gracefully without unexpected terminations, without
+  throwing in-progress transactions, and without corrupting the blockchain state
+  and the local block store. The node type
+  | ~cfg NodeCfg~                             | Node configuration                 |
+  | ~ctx context.Context~                     | Node shared context hierarchy      |
+  | ~ctxCancel func()~                        | Graceful shutdown context cancel   |
+  | ~wg *sync.WaitGroup~                      | Node shared wait group             |
+  | ~chErr chan error~                        | Concurrent processes error channel |
+  | ~evStream *EventStream~                   | Node event stream                  |
+  | ~state *chain.State~                      | Pending and confirmed state        |
+  | ~stateSync *StateSync~                    | State sync                         |
+  | ~grpcSrv *grpc.Server~                    | gRPC server                        |
+  | ~peerDisc *PeerDiscovery~                 | Peer discovery                     |
+  | ~txRelay *MsgRelay[SigTx, gRPCRealy]~     | Transaction relay                  |
+  | ~blockProp *BlockProposer~                | Block proposer                     |
+  | ~blkRelay *MsgRelay[SigBlock, gRPCRealy]~ | Block relay                        |
+  #+BEGIN_SRC go
+type Node struct {
+  cfg NodeCfg
+  // Graceful shutdown
+  ctx context.Context
+  ctxCancel func()
+  wg *sync.WaitGroup
+  chErr chan error
+  // Node components
+  evStream *EventStream
+  state *chain.State
+  stateSync *StateSync
+  grpcSrv *grpc.Server
+  peerDisc *PeerDiscovery
+  txRelay *MsgRelay[chain.SigTx, GRPCMsgRelay[chain.SigTx]]
+  blockProp *BlockProposer
+  blkRelay *MsgRelay[chain.SigBlock, GRPCMsgRelay[chain.SigBlock]]
+}
+
+func NewNode(cfg NodeCfg) *Node {
+  ctx, cancel := signal.NotifyContext(
+    context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL,
+  )
+  wg := new(sync.WaitGroup)
+  evStream := NewEventStream(ctx, wg, 100)
+  peerDiscCfg := PeerDiscoveryCfg{
+    NodeAddr: cfg.NodeAddr, Bootstrap: cfg.Bootstrap, SeedAddr: cfg.SeedAddr,
+  }
+  peerDisc := NewPeerDiscovery(ctx, wg, peerDiscCfg)
+  stateSync := NewStateSync(ctx, cfg, peerDisc)
+  txRelay := NewMsgRelay(ctx, wg, 100, GRPCTxRelay, false, peerDisc)
+  blkRelay := NewMsgRelay(ctx, wg, 10, GRPCBlockRelay, true, peerDisc)
+  blockProp := NewBlockProposer(ctx, wg, blkRelay)
+  return &Node{
+    cfg: cfg, ctx: ctx, ctxCancel: cancel, wg: wg, chErr: make(chan error, 1),
+    evStream: evStream, stateSync: stateSync, peerDisc: peerDisc,
+    txRelay: txRelay, blockProp: blockProp, blkRelay: blkRelay,
+  }
+}
+  #+END_SRC
+
+*** Starting the blockchain node
+
+- Start node :: The node start process initiates all the node concurrent
+  processes, sets up the node graceful shutdown mechanism, and waits for either
+  the signal to gracefully shutdown the node or an unrecoverable error from any
+  of the concurrent node processes. The node start process
+  - Defer the node shared context cancellation when the node process is stopped
+  - Start streaming domain events to subscribed clients
+  - Initialize the state and create the genesis of a new node or synchronize the
+    state and update the local block store of an out-of-sync node
+  - Start the gRPC server with the account, transaction, block, and node gRPC
+    services
+  - Start the peer discovery
+  - Start the transaction relay
+  - Start the block proposer if the node is the bootstrap and the authority node
+  - Start the block relay
+  - Wait for either the node cancellation signal on the node shared context
+    cancel channel or an unrecoverable error from any of the node concurrent
+    processes
+  - Gracefully shutdown the gRPC server
+  - Wait for all node concurrent processes to gracefully shutdown before
+    terminating the main node process
+  #+BEGIN_SRC go
+func (n *Node) Start() error {
+  defer n.ctxCancel()
+  n.wg.Add(1)
+  go n.evStream.StreamEvents()
+  state, err := n.stateSync.SyncState()
+  if err != nil {
+    return err
+  }
+  n.state = state
+  n.wg.Add(1)
+  go n.servegRPC()
+  n.wg.Add(1)
+  go n.peerDisc.DiscoverPeers(n.cfg.Period)
+  n.wg.Add(1)
+  go n.txRelay.RelayMsgs(n.cfg.Period)
+  if n.cfg.Bootstrap {
+    path := filepath.Join(n.cfg.KeyStoreDir, string(n.state.Authority()))
+    auth, err := chain.ReadAccount(path, []byte(n.cfg.AuthPass))
+    if err != nil {
+      return err
+    }
+    n.blockProp.SetAuthority(auth)
+    n.blockProp.SetState(n.state)
+    n.wg.Add(1)
+    go n.blockProp.ProposeBlocks(n.cfg.Period * 2)
+  }
+  n.wg.Add(1)
+  go n.blkRelay.RelayMsgs(n.cfg.Period)
+  select {
+  case <- n.ctx.Done():
+  case err = <- n.chErr:
+    fmt.Println(err)
+  }
+  n.ctxCancel() // restore default signal handling
+  n.grpcSrv.GracefulStop()
+  n.wg.Wait()
+  return err
+}
+  #+END_SRC
+
+*** The node gRPC server
+
+- gRPC server :: The gRPC server exposes the account, transaction, block, and
+  node gRPC services for clients and other nodes to interact with the node. Each
+  gRPC service exposes highly cohesive and loosely coupled blockchain functions
+  under the well-defined interface described by gRPC ProtoBuf messages and
+  methods. Each gRPC service depends on specific node components in order to
+  provide the defined functions. The gRPC server process is one of the node
+  concurrent processes, so all requests combing from the gRPC services and all
+  responses going to the gRPC services are concurrent. All gRPC services and
+  methods are concurrency safe as they internally rely either on the mutex-based
+  concurrency safe state implementation or the channel-based concurrency safe
+  implementation of other node concurrent processes. The gRPC server
+  - Create the TCP listener on the node address
+  - Defer closing the TCP connection after the graceful stop of the gRPC server
+  - Create a new gRPC server
+  - Register the node, account, transaction, and block gRPC services with the
+    gRPC server
+  - Start the gRPC server to accept connections
+  #+BEGIN_SRC go
+func (n *Node) servegRPC() {
+  defer n.wg.Done()
+  lis, err := net.Listen("tcp", n.cfg.NodeAddr)
+  if err != nil {
+    n.chErr <- err
+    return
+  }
+  defer lis.Close()
+  fmt.Printf("<=> gRPC %v\n", n.cfg.NodeAddr)
+  n.grpcSrv = grpc.NewServer()
+  node := rpc.NewNodeSrv(n.peerDisc, n.evStream)
+  rpc.RegisterNodeServer(n.grpcSrv, node)
+  acc := rpc.NewAccountSrv(n.cfg.KeyStoreDir, n.state)
+  rpc.RegisterAccountServer(n.grpcSrv, acc)
+  tx := rpc.NewTxSrv(
+    n.cfg.KeyStoreDir, n.cfg.BlockStoreDir, n.state.Pending, n.txRelay,
+  )
+  rpc.RegisterTxServer(n.grpcSrv, tx)
+  blk := rpc.NewBlockSrv(n.cfg.BlockStoreDir, n.evStream, n.state, n.blkRelay)
+  rpc.RegisterBlockServer(n.grpcSrv, blk)
+  err = n.grpcSrv.Serve(lis)
+  if err != nil {
+    n.chErr <- err
+    return
+  }
+}
+  #+END_SRC
+
+- gRPC services and methods :: All communication of clients with the blockchain
+  node and all communication between nodes in the peer-to-peer network happens
+  exclusively through the gRPC services and methods. Every node provides the CLI
+  for clients to interact with the node through the gRPC interface. The CLI can
+  interact with both local and remote nodes in exactly the same way. All
+  inter-node communication happens through the gRPC interface. Communication
+  with clients and inter-node communication uses the gRPC request-response, the
+  gRPC client streaming, and the gRPC server streaming
+  | gRPC service | gRPC method       | gRPC communication style |
+  |--------------+-------------------+--------------------------|
+  | =Account=    | =AccountCreate=   | gRPC request-response    |
+  | =Account=    | =AccountBalance=  | gRPC request-response    |
+  | =Tx=         | =TxSign=          | gRPC request-response    |
+  | =Tx=         | =TxSend=          | gRPC request-response    |
+  | =Tx=         | =TxReceive=       | gRPC client streaming    |
+  | =Tx=         | =TxSearch=        | gRPC server streaming    |
+  | =Tx=         | =TxProve=         | gRPC request-response    |
+  | =Tx=         | =TxVerify=        | gRPC request-response    |
+  | =Block=      | =GenesisSync=     | gRPC request-response    |
+  | =Block=      | =BlockSync=       | gRPC server streaming    |
+  | =Block=      | =BlockReceive=    | gRPC client streaming    |
+  | =Block=      | =BlockSearch=     | gRPC server streaming    |
+  | =Node=       | =PeerDiscover=    | gRPC request-response    |
+  | =Node=       | =StreamSubscribe= | gRPC server streaming    |
+
+*** The node CLI
+
+- Node CLI :: The node CLI allows local and remote clients to start the
+  blockchain node, subscribe to the node event stream, create a new account on
+  the blockchain, query the account balance, sign and send new transactions to
+  the blockchain node, search transactions, and search blocks on the blockchain.
+  All communication between the client and the node happens through the gRPC
+  interface that is the only interface to interact with the node
+  | CLI command             | CLI options                                    |
+  |-------------------------+------------------------------------------------|
+  | ~./bcn account create~  | =--node= target node address                   |
+  |                         | =--ownerpass= owner account password           |
+  | ~./bcn account balance~ | =--node= target node address                   |
+  |                         | =--account= account address                    |
+  | ~./bcn tx sign~         | =--node= target node address                   |
+  |                         | =--from= sender address                        |
+  |                         | =--to= recipient address                       |
+  |                         | =--value= transfer amount                      |
+  |                         | =--ownerpass= owner account password           |
+  | ~./bcn tx send~         | =--node= target node address                   |
+  |                         | =--sigtx= signed encoded transaction           |
+  | ~./bcn tx search~       | =--node= target node address                   |
+  |                         | =--hash= transaction hash prefix               |
+  |                         | =--from= sender address prefix                 |
+  |                         | =--to= recipient address prefix                |
+  |                         | =--account= involved account address prefix    |
+  | ~./bcn tx prove~        | =--node= target node address                   |
+  |                         | =--hash= transaction hash                      |
+  | ~./bcn tx verify~       | =--node= target node address                   |
+  |                         | =--hash= transaction hash                      |
+  |                         | =--mrkproof= Merkle proof                      |
+  |                         | =--mrkroot= Merkle root                        |
+  | ~./bcn block search~    | =--node= target node address                   |
+  |                         | =--number= block number                        |
+  |                         | =--hash= block hash prefix                     |
+  |                         | =--parent= parent hash prefix                  |
+  | ~./bcn node start~      | =--node= target node address                   |
+  |                         | =--bootstrap= bootstrap and authority node     |
+  |                         | =--seed= seed node address                     |
+  |                         | =--keystore= key store directory               |
+  |                         | =--blockstore= block store directory           |
+  |                         | =--chain= blockchain name                      |
+  |                         | =--authpass= authority account password        |
+  |                         | =--ownerpass= owner account password           |
+  |                         | =--balance= owner account balance              |
+  | ~./bcn node subscribe~  | =--node= target node address                   |
+  |                         | =--events= list of event types e.g. blk,tx,all |
+
+** Testing and usage
+
+*** Testing the node life cycle
+
+The =TestNodeStart= testing process
+- Set up the bootstrap node
+  - Configure the bootstrap node
+  - Start the bootstrap node in a separate goroutine
+  - Wait for the bootstrap node to start
+- Set up the gRPC client connection with the bootstrap node
+- Send several transactions to the bootstrap node in a separate goroutine
+  - Get the initial owner account and its balance from the genesis
+  - Re-create the initial owner account from the genesis
+  - Create the gRPC transaction client
+  - Start sending transaction to the bootstrap node
+    - Create and sign a new transaction
+    - Encode the signed transaction
+    - Call the gRPC =TxSend= method to send the signed encoded transaction to
+      the bootstrap node
+- Set up the client that subscribes to the node event stream
+  - Set up the gRPC client connection with the bootstrap node
+  - Create the gRPC node client
+  - Call the =StreamSubscribe= method to subscribe to the node event stream and
+    establish the gRPC server stream of domain events
+  - Define the expected events to receive after a successful block proposal and
+    the successful block confirmation
+  - Start consuming events from the gRPC server stream of domain events. For
+    each received event
+    - Decode the received domain event
+    - Verify that the type and the action of the domain event are correct
+- Stop gracefully the node
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run NodeStart
+#+END_SRC
+
+*** Using the blockchain network with two nodes
+
+This use case demonstrates how the blockchain peer-to-peer network with two
+nodes can be set up and used to send transactions and confirm blocks. The
+bootstrap node is also the authority node that proposes blocks and serves as the
+seed node for the initial peer discovery of the other node. A new blockchain
+account will be created on the other node. Then a transaction from the initial
+owner account on the bootstrap node will transfer funds to the new account
+created on the other node. Next a transaction from the new account on the other
+node will transfer funds to the initial owner account on the bootstrap node. Two
+clients will subscribe to the bootstrap node and the other node event stream to
+get notified when both transactions are confirmed. Finally the Merkle proofs for
+the confirmed transactions will be requested from the other node. The received
+Merkle proofs will be verified at the bootstrap node. This verifies the
+inclusion of the confirmed transactions into the list of transactions of the
+corresponding blocks
+- Initialize the blockchain by starting the bootstrap node with parameters for
+  the blockchain initial configuration
+  #+BEGIN_SRC fish
+set boot localhost:1122
+set authpass password
+set ownerpass password
+rm -rf .keystore* .blockstore* # cleanup if necessary
+./bcn node start --node $boot --bootstrap --authpass $authpass \
+  --ownerpass $ownerpass --balance 1000
+  #+END_SRC
+- Start a new node with the seed node set to the bootstrap node (in a new
+  terminal)
+  #+BEGIN_SRC fish
+set node localhost:1123
+./bcn node start --node $node --seed $boot
+  #+END_SRC
+- Subscribe a client to the event stream of the bootstrap node (in a new
+  terminal)
+  #+BEGIN_SRC fish
+./bcn node subscribe --node $boot --events tx
+# <~> tx validated
+# tx  6040ff5: 231c83f -> cb68e5d        2        1
+# <~> tx validated
+# tx  b87703f: cb68e5d -> 231c83f        1        1
+  #+END_SRC
+- Subscribe another client to the event stream of the other node (in a new
+  terminal)
+  #+BEGIN_SRC fish
+./bcn node subscribe --node $node --events tx
+# <~> tx validated
+# tx  6040ff5: 231c83f -> cb68e5d        2        1
+# <~> tx validated
+# tx  b87703f: cb68e5d -> 231c83f        1        1
+  #+END_SRC
+- Create a new account on the other node
+  #+BEGIN_SRC fish
+./bcn account create --node $node --ownerpass $ownerpass
+# acc cb68e5de26f72110e13e47b2519fcd48ca941a0f4f572bd9751654d01499b910
+  #+END_SRC
+- Define a shell function to create, sign, and send a transaction
+  #+BEGIN_SRC fish
+function txSignAndSend -a node from to value ownerpass
+  set tx (./bcn tx sign --node $node --from $from --to $to --value $value \
+    --ownerpass $ownerpass)
+  echo SigTx $tx
+  ./bcn tx send --node $node --sigtx $tx
+end
+  #+END_SRC
+- Create, sign, and send a transaction transferring funds from the initial owner
+  account from the genesis on the bootstrap node to the new account on the other
+  node
+  #+BEGIN_SRC fish
+set acc1 4f3748d4d46b695a85f1773b6cb86aa0837818d5df33550180c5b8da7c966a6f
+set acc2 bba08a59c80977b2bbf5df4f9d09471ddf1592aa7b0133377c5df865e73a8b12
+txSignAndSend $boot $acc1 $acc2 2 $ownerpass
+# SigTx {"from":"231c83f0a857cfb1e88f8adb92371e01aa1bdc80ef88ea443a2fccf02f444720","to":"cb68e5de26f72110e13e47b2519fcd48ca941a0f4f572bd9751654d01499b910","value":2,"nonce":1,"time":"2024-11-09T22:22:35.448578139+01:00","sig":"qYocOAxdbVzuVfAMNAc7/ljAXVaeDLOFfJkqUdxYoEkm0BNX5kxDsLPpLLJ3W5fzrSb9yAkbeVFED/MiEs0+AwA="}
+# tx 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+  #+END_SRC
+- Create, sign, and send a transaction transferring funds from the new account
+  on the other node to the initial owner account from the genesis on the
+  bootstrap node
+  #+BEGIN_SRC fish
+txSignAndSend $node $acc2 $acc1 1 $ownerpass
+# SigTx {"from":"cb68e5de26f72110e13e47b2519fcd48ca941a0f4f572bd9751654d01499b910","to":"231c83f0a857cfb1e88f8adb92371e01aa1bdc80ef88ea443a2fccf02f444720","value":1,"nonce":1,"time":"2024-11-09T22:23:50.396696709+01:00","sig":"3Olxnj5Zva4Nz8Ito6lrTRwP5OhOIwEmI5pQsdihWFlMxtLGiUf+9sIcX+QBi7CdG/uGtuHADV+wa4VgYj0//AE="}
+# tx b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+  #+END_SRC
+- Verify that confirmations of both validated transactions are received by both
+  subscribed clients to the bootstrap node and the other node (see commented
+  output above in the subscribed client terminals)
+- Check the balance of the initial owner account on the other node
+  #+BEGIN_SRC fish
+./bcn account balance --node $node --account $acc1
+# acc 231c83f0a857cfb1e88f8adb92371e01aa1bdc80ef88ea443a2fccf02f444720: 999
+  #+END_SRC
+- Check the balance of the new account on the bootstrap node
+  #+BEGIN_SRC fish
+./bcn account balance --node $boot --account $acc2
+# acc cb68e5de26f72110e13e47b2519fcd48ca941a0f4f572bd9751654d01499b910: 1
+  #+END_SRC
+- Search the first transaction by hash on the other node
+  #+BEGIN_SRC fish
+set tx1 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+./bcn tx search --node $node --hash $tx1
+# blk eb67728ed258d9e494f1d65dbdac3975d51921be3295116b6c5182f7fc8653db
+# mrk 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+# tx  6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+# tx  6040ff5: 231c83f -> cb68e5d        2        1    blk    1   eb67728   mrk 6040ff5
+  #+END_SRC
+- Search the second transaction by hash on the bootstrap node
+  #+BEGIN_SRC fish
+set tx2 b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+./bcn tx search --node $boot --hash $tx2
+# blk f48ffaf8f80fd0ade95bdb88d473b34e763d5cf233659e9ae8507b62c25f67a0
+# mrk b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx  b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx  b87703f: cb68e5d -> 231c83f        1        1    blk    2   f48ffaf   mrk b87703f
+  #+END_SRC
+- Search all transactions involving the initial owner account on the other node
+  #+BEGIN_SRC fish
+./bcn tx search --node $node --account $acc1
+# blk eb67728ed258d9e494f1d65dbdac3975d51921be3295116b6c5182f7fc8653db
+# mrk 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+# tx  6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+# tx  6040ff5: 231c83f -> cb68e5d        2        1    blk    1   eb67728   mrk 6040ff5
+# blk f48ffaf8f80fd0ade95bdb88d473b34e763d5cf233659e9ae8507b62c25f67a0
+# mrk b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx  b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx  b87703f: cb68e5d -> 231c83f        1        1    blk    2   f48ffaf   mrk b87703f
+  #+END_SRC
+- Define a shell function to request the Merkle proof for the specific
+  transaction hash and verify the Merkle proof which, in turn, confirms the
+  inclusion of the transaction into the list of transactions of a block
+  #+BEGIN_SRC fish
+function txProveAndVerify -a prover verifier hash mrkroot
+  set mrkproof (./bcn tx prove --node $prover --hash $hash)
+  echo MerkleProof $mrkproof
+  echo MerkleRoot $mrkroot
+  ./bcn tx verify --node $verifier --hash $hash \
+    --mrkproof $mrkproof --mrkroot $mrkroot
+end
+  #+END_SRC
+- Request Merkle proofs for the confirmed transactions from the other node.
+  Verify the received Merkle proofs for the confirmed transactions at the
+  bootstrap node. Confirm the inclusion of the confirmed transactions into the
+  list of transactions of the corresponding blocks
+  #+BEGIN_SRC fish
+set tx1 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+set mrk1 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+set tx2 b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+set mrk2 b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+txProveAndVerify $node $boot $tx1 $mrk1
+# MerkleProof [{"hash":"6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1","pos":1}]
+# MerkleRoot 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1
+# tx 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1 valid
+txProveAndVerify $node $boot $tx2 $mrk2
+# MerkleProof [{"hash":"b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8","pos":1}]
+# MerkleRoot b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8 valid
+  #+END_SRC
+- Confirm that the Merkle proof for the first transaction for an invalid Merkle
+  root of the second block is incorrect
+  #+BEGIN_SRC fish
+txProveAndVerify $node $boot $tx1 $mrk2
+# MerkleProof [{"hash":"6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1","pos":1}]
+# MerkleRoot b87703f6bf0035613f638657293da795bc771ff414c000da894b05d22f5a70b8
+# tx 6040ff5315af566ed974a737dbf460f04e73c9a713ef494e9baacfe7dd5dc8f1 INVALID
+  #+END_SRC

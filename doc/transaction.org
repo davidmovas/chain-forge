@@ -1,0 +1,575 @@
+* Transaction
+:PROPERTIES:
+:TOC: :include descendants
+:END:
+
+:CONTENTS:
+- [[#concepts-and-purpose][Concepts and purpose]]
+  - [[#cryptographic-hash-function][Cryptographic hash function]]
+  - [[#blockchain-transactions][Blockchain transactions]]
+  - [[#signing-and-verification-of-transactions][Signing and verification of transactions]]
+  - [[#transaction-search][Transaction search]]
+- [[#design-and-implementation][Design and implementation]]
+  - [[#keccak256-hash-function][Keccak256 hash function]]
+  - [[#transaction-and-signed-transaction-types][Transaction and signed transaction types]]
+  - [[#ecdsa-signing-and-verification-of-transactions][ECDSA signing and verification of transactions]]
+  - [[#grpc-txsign-method][gRPC TxSign method]]
+  - [[#grpc-txsearch-method][gRPC TxSearch method]]
+- [[#testing-and-usage][Testing and usage]]
+  - [[#testing-transaction-signing-and-verification][Testing transaction signing and verification]]
+  - [[#testing-grpc-txsign-method][Testing gRPC TxSign method]]
+  - [[#testing-grpc-txsearch-method][Testing gRPC TxSearch method]]
+  - [[#using-tx-sign-cli-command][Using tx sign CLI command]]
+  - [[#using-tx-search-cli-command][Using tx search CLI command]]
+:END:
+
+** Concepts and purpose
+
+*** Cryptographic hash function
+
+- Hash function :: The cryptographic hash function produces a random-looking,
+  fixed-length, unpredictable output (the random oracle) from an arbitrary large
+  input. The hash function is deterministic: the same input produces the same
+  output. A tiny change in the input produces a completely different output.
+  Security properties of a hash function
+  - Pre-image resistance :: The hash function is a one-way function: given a
+    hash, it is almost impossible to find the original input
+  - Second pre-image resistance :: Given an input and the hash of the input, it
+    is almost impossible to find another input that has the same hash
+  - Collision resistance :: It is almost impossible to find two different inputs
+    that have the same hash. Collisions are inevitable because the output length
+    is fixed, while the input is arbitrary large
+- Hash function and digital signature :: The hash function is used to check data
+  integrity of a message and its copy. The hash of a message is a unique
+  identifier of the message. Digitally signing a hash of a message is as secure
+  as signing the message itself, but much faster
+
+*** Blockchain transactions
+
+- Blockchain transaction :: The blockchain transaction transfers the value from
+  a sender account to a recipient account. Every transaction must be digitally
+  signed by the sender account that authorizes the transfer of funds and
+  authenticates the transaction. Multiple transactions are included in a block,
+  which, in turn, is added to the confirmed state and the local block store of
+  the blockchain node, once the consensus agreement is reached between nodes on
+  the blockchain. Confirmed transactions are irreversible. Confirmed
+  transactions are immutable. It is almost impossible to change the order or
+  content of confirmed transactions
+- Double spending problem :: The situation when the same digital asset can be
+  spent more then once. Only one of multiple transactions spending the same
+  asset should be validated and confirmed while others transactions must be
+  rejected. This blockchain prevents the double spending problem by tracking in
+  the blockchain state both: the account balance to check for availability of
+  funds, and the per-account monotonically increasing nonce to order
+  transactions signed from the same account
+- Transaction nonce :: The transaction nonce is a unique usually monotonically
+  increasing number used once per account to prevent the double spending
+  problem, transaction replay attacks, and ensure that each transaction from an
+  account is processed in order
+
+*** Signing and verification of transactions
+
+- Digital signature :: The private signing key is used to produce a digital
+  signature of a transaction. The corresponding public verifying key is used to
+  verify the digital signature of a transaction. The digital signature proves
+  the authenticity of a sender (origin authentication), the non-repudiation of a
+  sender, and the integrity of a transaction (message authentication)
+- Sign transaction :: The hash of an encoded transaction is signed with the
+  private key of the signing account. The sign operation produces a signature
+  that is used to verify the signed transaction
+- Verify transaction :: The public key is recovered from the hash of the encoded
+  transaction and the transaction signature. The account address derived from
+  the recovered public key is compared with the account address of the sender of
+  the signed transaction. If both addresses are equal, then the signature is
+  valid. A valid signature guarantees
+  - Sender authenticity :: The transaction has been signed by the owner of the
+    sender account, if the account private key has not been compromised
+  - Sender non-repudiation :: The sender cannot deny the act of sending the
+    validated and confirmed transaction, as the transaction must have been
+    signed with the private key of the sender account
+  - Transaction integrity :: The transaction content is immutable since
+    creation and has not been tampered with
+
+*** Transaction search
+
+- Transaction search :: The transaction search function locates confirmed
+  transactions on the blockchain after the transactions have been validated and
+  applied to the confirmed state and appended to the local block store. The
+  transaction search is performed against the local block store of the
+  blockchain node. The difference between the transaction search and the
+  subscription to the node event stream is that the node event stream allows
+  clients to proactively subscribe to the validated transaction event type
+  before transactions are validated and the event will be delivered only once,
+  while the transaction search locates transactions on demand as many times as
+  required after transactions have been validated and confirmed. The transaction
+  search locates validated and confirmed transactions in the local block store
+  by the prefix of the transaction hash, by the prefix of the sender account
+  address, by the prefix of the recipient account address, and by the prefix of
+  the account involved as a sender or as a recipient in a transaction
+
+** Design and implementation
+
+*** Keccak256 hash function
+
+Keccak256 hash function is used in this blockchain for hashing and signing of
+transactions, blocks, and the genesis
+
+- Keccak256 hash function :: The =Hash= type is a type alias to =[32]byte=. The
+  Keccak256 hash function is implemented as the constructor function on the hash
+  type. To hash a value of a specific type, this implementation requires the
+  type to have defined the JSON serialization that is used to encode the value
+  before hashing. The hash type defines string and byte slice representations of
+  the hash, as well as the JSON text marshal and unmarshal serialization
+  methods. The =DecodeHash= function decodes a string representation of a hash
+  into a hash value
+  #+BEGIN_SRC go
+type Hash [32]byte
+
+func NewHash(val any) Hash {
+  jval, _ := json.Marshal(val)
+  state := sha3.NewLegacyKeccak256()
+  _, _ = state.Write(jval)
+  hash := state.Sum(nil)
+  return Hash(hash)
+}
+
+func (h Hash) String() string {
+  return hex.EncodeToString(h[:])
+}
+
+func (h Hash) Bytes() []byte {
+  hash := [32]byte(h)
+  return hash[:]
+}
+
+func (h Hash) MarshalText() ([]byte, error) {
+  return []byte(hex.EncodeToString(h[:])), nil
+}
+
+func (h *Hash) UnmarshalText(hash []byte) error {
+  _, err := hex.Decode(h[:], hash)
+  return err
+}
+
+func DecodeHash(str string) (Hash, error) {
+  var hash Hash
+  _, err := hex.Decode(hash[:], []byte(str))
+  return hash, err
+}
+  #+END_SRC
+
+*** Transaction and signed transaction types
+
+This implementation makes distinction between the initial transaction type =Tx=
+before signing and the signed transaction type =SigTx= after signing. The =Tx=
+type is only used for initial creation of a transaction, signing of a new
+transaction, and verification of the signed transaction. Most of the blockchain
+components work exclusively with the =SigTx= type
+
+- Transaction type :: The =Tx= type represents a transaction on the blockchain.
+  The transaction defines the address of a sender account, the address of a
+  recipient account, the value amount to be transferred, the per account nonce
+  to prevent the transaction replay attacks, the double spending problem, and
+  process transaction signed from an account in order, and, finally, the time of
+  creation of the transaction. All transaction fields participate in producing
+  the hash of the transaction that is used to sign the transaction
+  | ~From Address~   | Sender account address    |
+  | ~To Address~     | Recipient account address |
+  | ~Value uint64~   | Value amount              |
+  | ~Nonce uint64~   | Per account nonce         |
+  | ~Time time.Time~ | Creation time             |
+  #+BEGIN_SRC go
+type Tx struct {
+  From Address `json:"from"`
+  To Address `json:"to"`
+  Value uint64 `json:"value"`
+  Nonce uint64 `json:"nonce"`
+  Time time.Time `json:"time"`
+}
+
+func NewTx(from, to Address, value, nonce uint64) Tx {
+  return Tx{From: from, To: to, Value: value, Nonce: nonce, Time: time.Now()}
+}
+
+func (t Tx) Hash() Hash {
+  return NewHash(t)
+}
+  #+END_SRC
+
+- Signed transaction type :: The =SigTx= type embeds the =Tx= type and includes
+  the transaction signature. The string representation of a signed transaction
+  is defined to present the transaction to the end user
+  | ~Tx~         | Embedded original transaction                 |
+  | ~Sig []byte~ | Digital signature of the original transaction |
+  #+BEGIN_SRC go
+type SigTx struct {
+  Tx
+  Sig []byte `json:"sig"`
+}
+
+func NewSigTx(tx Tx, sig []byte) SigTx {
+  return SigTx{Tx: tx, Sig: sig}
+}
+
+func (t SigTx) Hash() Hash {
+  return NewHash(t)
+}
+
+func (t SigTx) String() string {
+  return fmt.Sprintf(
+    "tx %.7s: %.7s -> %.7s %8d %8d", t.Hash(), t.From, t.To, t.Value, t.Nonce,
+  )
+}
+  #+END_SRC
+
+The =TxHash= function function produces the Keccak256 hash of a signed
+transaction. The transaction hash function is used to parameterize generic
+algorithms that need to hash values using different hash functions.
+Specifically, the Merkle hash algorithm uses the transaction hash function to
+convert the list of transaction of a block into the list of hashes to start the
+construction of the Merkle tree
+
+The =TxPairHash= function combines two hashes into a single hash. The
+transaction pair hash function is used to parameterize generic algorithms that
+need to combine hash values into a single hash. Specifically, the Merkle prove
+and the Merkle verify algorithms use the transaction pair hash function to
+derive the Merkle proof from the Merkle tree and to verify the Merkle proof
+respectively. If the right hash is not set and has the default value, only the
+left hash is returned as part of the hash combination process
+#+BEGIN_SRC go
+func TxHash(tx SigTx) Hash {
+  return NewHash(tx)
+}
+
+func TxPairHash(l, r Hash) Hash {
+  var nilHash Hash
+  if r == nilHash {
+    return l
+  }
+  return NewHash(l.String() + r.String())
+}
+#+END_SRC
+
+*** ECDSA signing and verification of transactions
+
+This blockchain uses the Elliptic Curve Digital Signature Algorithm (ECDSA) for
+signing and verification of signed transactions. Specifically, the Secp256k1
+elliptic curve is used for signing and verification of signed transactions
+
+- Secp256k1 sign transaction :: The transaction signing process requires the
+  owner-provided password and is performed from the account of the sender. The
+  transaction signing process
+  - Produce the Keccak256 hash of the input transaction
+  - Sign the Keccak256 hash of the transaction using the ECDSA algorithm on the
+    Secp256k1 elliptic curve
+  - Construct the signed transaction by adding the produced digital signature to
+    the original transaction
+  #+BEGIN_SRC go
+func (a Account) SignTx(tx Tx) (SigTx, error) {
+  hash := tx.Hash().Bytes()
+  sig, err := ecc.SignBytes(a.prv, hash, ecc.LowerS | ecc.RecID)
+  if err != nil {
+    return SigTx{}, err
+  }
+  stx := NewSigTx(tx, sig)
+  return stx, nil
+}
+  #+END_SRC
+
+- Secp256k1 verify transaction :: The transaction verification process does not
+  require any external information like the owner-provided password for a signed
+  transaction to be verified. The signed transaction instance contains all the
+  necessary information to verify the signature of the signed transaction. The
+  transaction verification process
+  - Recover the public key from the hash of the original embedded transaction
+    and the transaction signature
+  - Derive the account address from the recovered public key
+  - If the derived account address is equal to the account address of the sender
+    of the signed transaction, then the transaction signature is valid
+  #+BEGIN_SRC go
+func VerifyTx(tx SigTx) (bool, error) {
+  hash := tx.Tx.Hash().Bytes()
+  pub, err := ecc.RecoverPubkey("P-256k1", hash, tx.Sig)
+  if err != nil {
+    return false, err
+  }
+  acc := NewAddress(pub)
+  return acc == tx.From, nil
+}
+  #+END_SRC
+
+*** gRPC =TxSign= method
+
+The gRPC =Tx= service provides the =TxSign= method to digitally sign a new
+transaction before sending the transaction to the blockchain node for
+validation. The interface of the service
+#+BEGIN_SRC protobuf
+message TxSignReq {
+  string From = 1;
+  string To = 2;
+  uint64 Value = 3;
+  string Password = 4;
+}
+
+message TxSignRes {
+  bytes Tx = 1;
+}
+
+service Tx {
+  rpc TxSign(TxSignReq) returns (TxSignRes);
+}
+#+END_SRC
+
+The implementation of the =TxSign= method
+- Re-create the owner account from the local key store using the owner-provided
+  password
+- Construct a new transaction from the request arguments
+  - =From= specifies the sender address
+  - =To= specifies the recipient address
+  - =Value= indicates the value amount to be transferred
+- Request from the pending state and increment by 1 the current value of the
+  nonce for the sender account
+- Sign the transaction with the sender account private key
+- Encode the signed transaction
+- Return the encoded signed transaction to the client
+#+BEGIN_SRC go
+func (s *TxSrv) TxSign(_ context.Context, req *TxSignReq) (*TxSignRes, error) {
+  path := filepath.Join(s.keyStoreDir, req.From)
+  acc, err := chain.ReadAccount(path, []byte(req.Password))
+  if err != nil {
+    return nil, status.Errorf(codes.InvalidArgument, err.Error())
+  }
+  tx := chain.NewTx(
+    chain.Address(req.From), chain.Address(req.To), req.Value,
+    s.txApplier.Nonce(chain.Address(req.From)) + 1,
+  )
+  stx, err := acc.SignTx(tx)
+  if err != nil {
+    return nil, status.Errorf(codes.Internal, err.Error())
+  }
+  jtx, err := json.Marshal(stx)
+  if err != nil {
+    return nil, status.Errorf(codes.Internal, err.Error())
+  }
+  res := &TxSignRes{Tx: jtx}
+  return res, nil
+}
+#+END_SRC
+
+*** gRPC =TxSearch= method
+
+The gRPC =Tx= service provides the =TxSearch= method to locate confirmed
+transactions on the local block store. The transactions that satisfy the search
+criteria are returned to the client through the gRPC server stream. The
+interface of the service
+#+BEGIN_SRC protobuf
+message TxSearchReq {
+  string Hash = 1;
+  string From = 2;
+  string To = 3;
+  string Account = 4;
+}
+
+message TxSearchRes {
+  bytes Tx = 1;
+}
+
+service Tx {
+  rpc TxSearch(TxSearchReq) returns (stream TxSearchRes);
+}
+#+END_SRC
+
+The implementation of the =TxSearch= method
+- Create the iterator over the blocks in the local block store
+- Defer closing the iterator
+- Iterate over each block in the local block store in order. For each block
+  - Iterate over each transaction of the confirmed block. For each transaction
+    - Search by the transaction hash prefix
+      - Send the first transaction that matches the requested transaction hash
+        prefix over the gRPC server stream and stop the transaction search
+        process
+    - Search by the prefix of the sender, recipient, or account address
+      - Send every transaction that matches the search criteria over the gRPC
+        server stream and keep searching transactions until all transactions in
+        all blocks of the local block store are searched
+#+BEGIN_SRC go
+func (s *TxSrv) TxSearch(
+  req *TxSearchReq, stream grpc.ServerStreamingServer[TxSearchRes],
+) error {
+  blocks, closeBlocks, err := chain.ReadBlocks(s.blockStoreDir)
+  if err != nil {
+    return status.Errorf(codes.NotFound, err.Error())
+  }
+  defer closeBlocks()
+  prefix := strings.HasPrefix
+  block: for err, blk := range blocks {
+    if err != nil {
+      return status.Errorf(codes.Internal, err.Error())
+    }
+    for _, tx := range blk.Txs {
+      if len(req.Hash) > 0 && prefix(tx.Hash().String(), req.Hash) {
+        err = sendTxSearchRes(blk, tx, stream)
+        if err != nil {
+          return status.Errorf(codes.Internal, err.Error())
+        }
+        break block
+      }
+      if len(req.From) > 0 && prefix(string(tx.From), req.From) ||
+        len(req.To) > 0 && prefix(string(tx.To), req.To) ||
+        len(req.Account) > 0 &&
+          (prefix(string(tx.From), req.From) || prefix(string(tx.To), req.To)) {
+        err := sendTxSearchRes(blk, tx, stream)
+        if err != nil {
+          return status.Errorf(codes.Internal, err.Error())
+        }
+      }
+    }
+  }
+  return nil
+}
+#+END_SRC
+
+** Testing and usage
+
+*** Testing transaction signing and verification
+
+The =TestTxSignTxVerifyTx= testing process
+- Create a new account
+- Create and sign a transaction
+- Verify that the signature of the signed transaction is valid
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run TxSignTxVerifyTx
+#+END_SRC
+
+*** Testing gRPC =TxSign= method
+
+The =TestTxSign= testing process
+- Create and persist the genesis
+- Create the state from the genesis
+- Create and persist a new account
+- Set up the gRPC server and client
+- Create the gRPC transaction client
+- Call the =TxSign= method to sign the new transaction
+- Decode the signed transaction
+- Verify that the signature of the signed transaction is valid
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run TxSign
+#+END_SRC
+
+*** Testing gRPC =TxSearch= method
+
+The =TestTxSearch= testing process
+- Create and persist the genesis
+- Create the state from the genesis
+- Create several confirmed blocks on the state and on the local block store
+- Set up the gRPC server and client
+- Search by the sender account address
+  - Get the initial owner account from the genesis
+  - Search transactions by the sender account address that equals to the initial
+    owner account address
+  - Verify that all transactions are found
+  - Verify that all found transactions satisfy the search criteria
+- Search by the transaction hash
+  - Search transactions by the transaction hash of an existing transaction
+  - Verify that the transaction is found
+  - Verify that the found transaction matches the search criteria
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run TxSearch
+#+END_SRC
+
+*** Using =tx sign= CLI command
+
+The gRPC =TxSign= method is exposed through the CLI. Create and sign a new
+transaction on the bootstrap node
+- Start the bootstrap node
+  #+BEGIN_SRC fish
+set boot localhost:1122
+set authpass password
+./bcn node start --node $boot --bootstrap --authpass $authpass
+  #+END_SRC
+- Create and sign a new transaction (in a new terminal)
+  - =--node= specifies the node address
+  - =--from= defines the sender account address
+  - =--value= defines the recipient account address
+  - =--ownerpass= provides the sender account password to sign the transaction
+  #+BEGIN_SRC fish
+set sender d54173365ca6c47d482b0a06ba4f196049014145093778427383de19d66a76d7
+set ownerpass password
+./bcn tx sign --node $boot --from $sender --to to --value 12 \
+  --ownerpass $ownerpass
+  #+END_SRC
+  The structure of the signed encoded transaction
+  #+BEGIN_SRC json
+{
+  "from": "d54173365ca6c47d482b0a06ba4f196049014145093778427383de19d66a76d7",
+  "to": "recipient",
+  "value": 12,
+  "nonce": 1,
+  "time": "2024-09-29T09:57:28.65978649+02:00",
+  "sig": "Cz+qV8DaD+sCnaLnTR2S49a/9nwsYbe2EF8Y6Upa/vYoGY7P9qSmzDSBBHQolg6KdxIiS/NrXvcevLiSYJpbvQE="
+}
+  #+END_SRC
+
+*** Using =tx search= CLI command
+
+The gRPC =TxSearch= method is exposed through the CLI. Sign, send, and search
+validated and confirmed transactions on the bootstrap node
+- Initialize the blockchain by starting the bootstrap node with parameters for
+  the blockchain initial configuration
+  #+BEGIN_SRC fish
+set boot localhost:1122
+set authpass password
+set ownerpass password
+rm -rf .keystore* .blockstore* # cleanup if necessary
+./bcn node start --node $boot --bootstrap --authpass $authpass \
+  --ownerpass $ownerpass --balance 1000
+  #+END_SRC
+- Create and persist a new account to the local key store of the bootstrap node
+  (in a new terminal)
+  #+BEGIN_SRC fish
+./bcn account create --node $boot --ownerpass $ownerpass
+# acc 0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba
+  #+END_SRC
+- Define a shell function to create, sign, and send a transaction
+  #+BEGIN_SRC fish
+function txSignAndSend -a node from to value ownerpass
+  set tx (./bcn tx sign --node $node --from $from --to $to --value $value \
+    --ownerpass $ownerpass)
+  echo SigTx $tx
+  ./bcn tx send --node $node --sigtx $tx
+end
+  #+END_SRC
+- Create, sign, and send a transaction transferring funds between the initial
+  owner account from the genesis and the new account
+  #+BEGIN_SRC fish
+set acc1 66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105
+set acc2 0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba
+txSignAndSend $boot $acc1 $acc2 2 $ownerpass
+# SigTx {"from":"66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105","to":"0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba","value":2,"nonce":1,"time":"2024-11-09T10:27:12.871221439+01:00","sig":"V7WHwt0hOvpI+d6RJErDiO45zj3rzmrb3Yaf1YTVc+d1LUwQhdTtz3OKmvD02jtVkG+DQeUYH9SaxcFd/wsl0gA="}
+# tx 4312eb8f506a00c4f4f111ea8b318a871615115e5b1a49f14784c5f90a04baeb
+txSignAndSend $boot $acc2 $acc1 1 $ownerpass
+# SigTx {"from":"0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba","to":"66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105","value":1,"nonce":1,"time":"2024-11-09T10:27:12.921031364+01:00","sig":"/V/bwvTnYWnU4GrYvDOp44P1rx6sQZl7b9NXiNefcopqqWOsMyZuUAo00hURL2BWs1xUw24U/7gAvHX+FLg2IwA="}
+# tx bd849704122be82ee588c2abfacb8e12fb5bac0916356babcdb2b1683bbc684e
+  #+END_SRC
+- Search the confirmed transactions involving the initial owner account from the
+  genesis
+  #+BEGIN_SRC fish
+./bcn tx search --node localhost:1122 --account $acc1
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# tx  4312eb8f506a00c4f4f111ea8b318a871615115e5b1a49f14784c5f90a04baeb
+# tx  4312eb8: 66d6141 -> 0a6c57d        2        1    blk    1   50de747   mrk c39f778
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# tx  bd849704122be82ee588c2abfacb8e12fb5bac0916356babcdb2b1683bbc684e
+# tx  bd84970: 0a6c57d -> 66d6141        1        1    blk    1   50de747   mrk c39f778
+  #+END_SRC
+- Search the confirmed transactions by hash on the bootstrap node
+  #+BEGIN_SRC fish
+set tx1 4312eb8f506a00c4f4f111ea8b318a871615115e5b1a49f14784c5f90a04baeb
+./bcn tx search --node $boot --hash $tx1
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# tx  4312eb8f506a00c4f4f111ea8b318a871615115e5b1a49f14784c5f90a04baeb
+# tx  4312eb8: 66d6141 -> 0a6c57d        2        1    blk    1   50de747   mrk c39f778
+  #+END_SRC

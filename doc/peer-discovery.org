@@ -1,0 +1,291 @@
+* Peer discovery
+:PROPERTIES:
+:TOC: :include descendants
+:END:
+
+:CONTENTS:
+- [[#concepts-and-purpose][Concepts and purpose]]
+  - [[#peer-discovery][Peer discovery]]
+- [[#design-and-implementation][Design and implementation]]
+  - [[#concurrency-safe-peer-discovery-type][Concurrency safe peer discovery type]]
+  - [[#adding-and-reading-known-peers][Adding and reading known peers]]
+  - [[#node-graceful-shutdown-mechanism][Node graceful shutdown mechanism]]
+  - [[#peer-discovery-algorithm][Peer discovery algorithm]]
+  - [[#grpc-peerdiscover-method][gRPC PeerDiscover method]]
+- [[#testing-and-usage][Testing and usage]]
+  - [[#testing-grpc-peerdiscover-method][Testing gRPC PeerDiscover method]]
+  - [[#testing-peer-discovery][Testing peer discovery]]
+:END:
+
+** Concepts and purpose
+
+*** Peer discovery
+
+- Peer discovery :: The peer discovery process is necessary in the peer-to-peer
+  network to interconnect autonomous and self-contained nodes into the
+  peer-to-peer network without a central authority. The peer discovery process
+  happens automatically and periodically on every node. This ensures that every
+  node independently builds its network of peers without a central authority.
+  This also contributes to the resilience of the peer-to-peer network by
+  dropping connections with nodes that have gone offline and by automatically
+  and continuously establishing new connections with healthy nodes. The peer
+  discovery process on every node, except the bootstrap node, starts with the
+  seed node address that is the only explicitly provided peer address for a node
+  to start discovering new peers. Usually the seed node is the bootstrap node.
+  On start a new node fetches from the seed node the set of initial peers that
+  are saved for periodic reference in order to build the network of peers for
+  the node. The node maintains the list of unique healthy peers. The node
+  periodically connects to each peer from the list of known peers and fetches
+  the list of known peers of the contacted peer. Only new peers are added to the
+  list of known peers of the node discarding already known peers and the node's
+  own address
+- Peer discovery on bootstrap node :: The bootstrap node is the only node that
+  is started without providing the seed node address. The bootstrap node builds
+  the list of known peers by saving addresses of the peers that have contacted
+  the bootstrap node as part of the peer discovery process. Later on the
+  bootstrap node uses exactly the same peer discovery algorithm as any other
+  node on the peer-to-peer network
+
+** Design and implementation
+
+*** Concurrency safe peer discovery type
+
+- Peer discovery type :: The =PeerDiscovery= type maintains the list of unique,
+  healthy, known peers and implements the peer discovery algorithm. The peer
+  discovery algorithm is performed periodically in order to keep the node
+  connected to healthy peers, discover new peers, drop connections with
+  unhealthy peers, and provide peers information to other components of the node
+  e.g. the transaction relay, the block relay. The peer discovery type is
+  concurrency safe. Adding new peers and reading the list of known peers is
+  concurrency safe by employing the readers-writer mutex. The readers-writer
+  mutex improves the throughput and reduces the latency by allowing either
+  multiple concurrent peers readers with no peers writer or a single peers
+  writer without any peers readers. The peer discovery type contains the peer
+  discovery configuration, the node shared context hierarchy for the node
+  graceful shutdown mechanism, the node shared waiting group to let the peer
+  discovery algorithm gracefully terminate before the shutdown of the node, the
+  readers-writer mutex for safe concurrent access to the list of known peers,
+  and the set of unique, healthy, known peers
+  | ~cfg peerDiscoveryCfg~      | Peer discovery configuration       |
+  | ~ctx context.Context~       | Node shared context hierarchy      |
+  | ~wg *sync.WaitGroup~        | Node shared waiting group          |
+  | ~mtx sync.RWMutex~          | Readers-writer mutex               |
+  | ~peers map[string]struct{}~ | Set of unique, healthy known peers |
+  #+BEGIN_SRC go
+type PeerDiscovery struct {
+  cfg PeerDiscoveryCfg
+  ctx context.Context
+  wg *sync.WaitGroup
+  mtx sync.RWMutex
+  peers map[string]struct{}
+}
+
+func NewPeerDiscovery(
+  ctx context.Context, wg *sync.WaitGroup, cfg PeerDiscoveryCfg,
+) *PeerDiscovery {
+  peerDisc := &PeerDiscovery{
+    ctx: ctx, wg: wg, cfg: cfg, peers: make(map[string]struct{}),
+  }
+  if !peerDisc.Bootstrap() {
+    peerDisc.AddPeers(peerDisc.cfg.seedAddr)
+  }
+  return peerDisc
+}
+  #+END_SRC
+
+*** Adding and reading known peers
+
+- Add peers :: The add peers operation is concurrency safe and is executed every
+  time the peer discovery algorithm fetches a list of peers from another node.
+  There may be peers in the fetched list of peers that are already known to the
+  node. The add peers operation iterates over the list of fetched peers and adds
+  only new peers to the list of known peers of the node. The add peers operation
+  - Lock the list of known peers for writing
+  - Iterate over the list of fetched peers from another node
+  - Add only new, not yet known peers, to the list of known peers of the node
+  #+BEGIN_SRC go
+func (d *PeerDiscovery) AddPeers(peers ...string) {
+  d.mtx.Lock()
+  defer d.mtx.Unlock()
+  for _, peer := range peers {
+    if peer != d.cfg.nodeAddr {
+      _, exist := d.peers[peer]
+      if !exist {
+        fmt.Printf("<=> Peer %v\n", peer)
+      }
+      d.peers[peer] = struct{}{}
+    }
+  }
+}
+  #+END_SRC
+
+- Read peers :: The read peers operation is concurrency safe and is executed for
+  every peer discovery cycle, when relaying validated transactions, and when
+  relaying validated blocks. The read peers operation converts the set of known
+  peers into a slice of known peers. The read peers operation
+  - Lock the list of known peers for reading
+  - Convert the set of known peers into a slice of known peers
+  #+BEGIN_SRC go
+func (d *PeerDiscovery) Peers() []string {
+  d.mtx.RLock()
+  defer d.mtx.RUnlock()
+  peers := make([]string, 0, len(d.peers))
+  for peer := range d.peers {
+    peers = append(peers, peer)
+  }
+  return peers
+}
+  #+END_SRC
+
+- Read peers with self-reference :: The read peers with the self-reference
+  operation adds the node's own address to the list of known peers in order to
+  relay proposed blocks to the authority node that created and proposed the
+  block. When the authority node creates, validates, and proposes a new block,
+  the block is relayed to all known peers including the authority node itself.
+  This design allows to separate the block proposal algorithm from the block
+  validation and confirmation algorithm even if two algorithms are performed on
+  the same authority node. The read peers with the self-reference operation
+  appends the node's own address to the list of known peers. The read peers with
+  the self-reference method
+  - Append the node's own address to the list of known peers
+  #+BEGIN_SRC go
+func (d *PeerDiscovery) SelfPeers() []string {
+  return append(d.Peers(), d.cfg.nodeAddr)
+}
+  #+END_SRC
+
+*** Node graceful shutdown mechanism
+
+- Node graceful shutdown mechanism :: The node graceful shutdown mechanism
+  avoids unexpected termination of the concurrent processes on the node in the
+  middle of processing of a unit of work. The node graceful shutdown mechanism
+  ensures that the concurrent processes on the node are timely notified to
+  gracefully shutdown, and the node main goroutine waits for the concurrent
+  processes to gracefully terminate after finishing they current unit of work.
+  The node graceful shutdown mechanism is implemented using the node context
+  hierarchy shared between all concurrent processes of the node for signaling a
+  shutdown, and the node shared wait group to let concurrent processes to
+  terminate gracefully by finishing the current unit of work. The concurrent
+  counter of the node shared wait group is incremented every time a new
+  concurrent process is started on the node. When the node receives the signal
+  to shutdown, the signal is automatically propagated through the node shared
+  context hierarchy to all concurrent processes of the node. Each concurrent
+  process finishes processing of the current unit of work and decrements the
+  concurrent counter of the node shared wait group to indicate the graceful
+  shutdown of the concurrent process. The node main goroutine waits for all
+  concurrent processes on the node to notify graceful shutdown success when the
+  concurrent counter of the wait group becomes zero then the node main goroutine
+  gracefully terminates
+
+*** Peer discovery algorithm
+
+- Peer discovery algorithm :: The peer discovery algorithm is periodically
+  executed in a separate goroutine within the node process. The peer discovery
+  algorithm is fully integrated with the node graceful shutdown mechanism to
+  avoid unexpected terminations in the middle of the peer discovery cycle. The
+  peer discovery algorithm creates the recurrent tick with a configurable period
+  that specifies the frequency of the peer discovery cycles. The peer discovery
+  algorithm composes the cancellation channel of the node shared context
+  hierarchy for the graceful shutdown with the tick channel for the next peer
+  discovery cycle. On the due time the peer discovery algorithm fetches peers
+  from the list of known peers and adds new peers to the internal set of unique,
+  healthy, known peers. The peer discovery algorithm
+  - Defer the node shared wait group done to indicate the success of the
+    graceful termination of the peer discovery process
+  - Create the recurrent tick with a configurable period
+  - Compose the cancellation channel of the node shared context hierarchy with
+    the tick channel
+  - For the recurrent tick
+    - Fetch peers from the list of known peers
+    - Add newly discovered peers to the list of known peers
+  #+BEGIN_SRC go
+func (d *PeerDiscovery) DiscoverPeers(period time.Duration) {
+  defer d.wg.Done()
+  tick := time.NewTicker(period)
+  defer tick.Stop()
+  for {
+    select {
+    case <- d.ctx.Done():
+      return
+    case <- tick.C:
+      for _, peer := range d.Peers() {
+        if peer != d.cfg.NodeAddr {
+          peers, err := d.grpcPeerDiscover(peer)
+          if err != nil {
+            fmt.Println(err)
+            continue
+          }
+          d.AddPeers(peers...)
+        }
+      }
+    }
+  }
+}
+  #+END_SRC
+
+*** gRPC =PeerDiscover= method
+
+The gRPC =Node= service provides the =PeerDiscover= method to fetch the list of
+known peers from a node. The interface of the service
+#+BEGIN_SRC protobuf
+message PeerDiscoverReq {
+  string Peer = 1;
+}
+
+message PeerDiscoverRes {
+  repeated string Peers = 1;
+}
+
+service Node {
+  rpc PeerDiscover(PeerDiscoverReq) returns (PeerDiscoverRes);
+}
+#+END_SRC
+
+The implementation of the =PeerDiscover= method
+- Add the requesting node address to the list of known peers if the server node
+  is the bootstrap node, effectively collecting peers from the peer-to-peer
+  network
+- Return the list of known peers to the requesting node
+#+BEGIN_SRC go
+func (s *NodeSrv) PeerDiscover(
+  _ context.Context, req *PeerDiscoverReq,
+) (*PeerDiscoverRes, error) {
+  if s.peerDisc.Bootstrap() {
+    s.peerDisc.AddPeers(req.Peer)
+  }
+  peers := s.peerDisc.Peers()
+  res := &PeerDiscoverRes{Peers: peers}
+  return res, nil
+}
+#+END_SRC
+
+** Testing and usage
+
+*** Testing gRPC =PeerDiscover= method
+
+The =TestPeerDiscover= testing process
+- Set up the bootstrap node
+  - Create the peer discovery without starting for the bootstrap node
+  - Set up the gRPC server and client for the bootstrap node
+- Set up the new node
+  - Create the gRPC node client
+  - Call the =PeerDiscover= method to discover peers
+- Verify that the new node address is returned by the bootstrap node in the list
+  of discovered peers
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run PeerDiscover
+#+END_SRC
+
+*** Testing peer discovery
+
+The =TestPeerDiscovery= testing process
+- Set up the bootstrap node
+  - Create the peer discovery without staring for the bootstrap node
+  - Start the gRPC server on the bootstrap node
+- Set up the new node
+  - Create and start the peer discovery for the new node
+  - Wait for the peer discovery to discover peers
+- Verify that the bootstrap node and the new node have discovered each other
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run PeerDiscovery
+#+END_SRC

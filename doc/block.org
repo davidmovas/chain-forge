@@ -1,0 +1,644 @@
+* Block
+:PROPERTIES:
+:TOC: :include descendants
+:END:
+
+:CONTENTS:
+- [[#concepts-and-purpose][Concepts and purpose]]
+  - [[#genesis-and-blocks][Genesis and blocks]]
+  - [[#immutable-chain-of-blocks][Immutable chain of blocks]]
+  - [[#block-search][Block search]]
+- [[#design-and-implementation][Design and implementation]]
+  - [[#genesis-and-signed-genesis-types][Genesis and signed genesis types]]
+  - [[#ecdsa-signing-and-verification-of-genesis][ECDSA signing and verification of genesis]]
+  - [[#persistence-and-re-creation-of-genesis][Persistence and re-creation of genesis]]
+  - [[#block-and-signed-block-types][Block and signed block types]]
+  - [[#ecdsa-signing-and-verification-of-blocks][ECDSA signing and verification of blocks]]
+  - [[#persistence-and-re-creation-of-blocks][Persistence and re-creation of blocks]]
+  - [[#grpc-blocksearch-method][gRPC BlockSearch method]]
+- [[#testing-and-usage][Testing and usage]]
+  - [[#testing-genesis-signing-and-verification][Testing genesis signing and verification]]
+  - [[#testing-block-signing-and-verification][Testing block signing and verification]]
+  - [[#testing-grpc-blocksearch-method][Testing gRPC BlockSearch method]]
+  - [[#using-block-search-cli-command][Using block search CLI command]]
+:END:
+
+** Concepts and purpose
+
+*** Genesis and blocks
+
+- Blockchain genesis :: The blockchain genesis file is used to initialize a new
+  blockchain. The genesis file contains the initial configuration parameters of
+  the blockchain e.g. the name of the blockchain, the time of the initiation of
+  the blockchain; and the initial balances of the initial owner accounts. The
+  genesis file may contain other blockchain configuration parameters like the
+  address of the authority account that signs the genesis and all blocks on the
+  blockchain
+- Blockchain block :: The blockchain block contains a list of validated
+  transactions along with the Merkle root for the checking transaction integrity
+  and verifying the inclusion of transactions into a block, acts as a node of a
+  linked list of all blocks on the blockchain, and is a unit of integrity
+  checking on the blockchain. The block represents a unit of consensus agreement
+  between nodes on the blockchain. Blocks of transactions are created, signed
+  and proposed by the authority node and validated and confirmed by the
+  validator nodes. All proposed and confirmed blocks on the blockchain are
+  digitally signed by the authority node. A block must be either validated and
+  added to the blockchain with all contained transactions or rejected completely
+  even if some transactions are valid
+
+*** Immutable chain of blocks
+
+- Chain of blocks :: Blocks on the blockchain are organized into a linked list
+  of blocks where each blocks acts as a node of the linked list. Each block has
+  the reference that contains the hash of the parent block. The parent hash of
+  every block represents the linking mechanism and the integrity checking
+  mechanism that ensures immutability of all blocks and contained transactions,
+  ordering of all blocks and contained transactions. A minimal change in content
+  or ordering of blocks or contained transactions immediately results in a
+  different hash of the modified block and breaks the parent hash linking
+  mechanism on the blockchain. The parent hash of the first block is the hash of
+  the genesis
+
+*** Block search
+
+- Block search :: The block search function locates validated confirmed blocks
+  on the blockchain after the blocks have been validated and applied to the
+  confirmed state and appended to the local block store. The block search is
+  performed against the local block store of the blockchain node. The difference
+  between the block search and the subscription to the node event stream is that
+  the node event stream allows clients to proactively subscribe to the validated
+  block event type before blocks are validated and the event will be delivered
+  only once, while the block search locates blocks on demand as many times as
+  required after blocks have been validated and confirmed. The block search
+  locates validated blocks in the local block store by the block number, the
+  prefix of the block hash, and by the prefix of the parent hash
+
+** Design and implementation
+
+*** Genesis and signed genesis types
+
+The implementation makes distinction between the =Genesis= type that contains
+the initial configuration of the blockchain and the =SigGenesis= type that also
+includes the signature of the genesis by the authority account. Most of the
+blockchain components work exclusively with the =SigGenesis= type
+
+- Genesis type :: The =Genesis= type contains the initial configuration of the
+  blockchain. Specifically, the blockchain name, the authority account address
+  to sign the genesis and all proposed blocks, the initial balances on the
+  blockchain that create the initial amount of money from thin air, the creation
+  time of the genesis
+  | ~Chain string~                | Blockchain name           |
+  | ~Authority Address~           | Authority account address |
+  | ~Balances map[Address]uint64~ | Initial account balances  |
+  | ~Time time.Time~              | Creation time             |
+  #+BEGIN_SRC go
+type Genesis struct {
+  Chain string `json:"chain"`
+  Authority Address `json:"authority"`
+  Balances map[Address]uint64 `json:"balances"`
+  Time time.Time `json:"time"`
+}
+
+func NewGenesis(name string, authority, acc Address, balance uint64) Genesis {
+  balances := make(map[Address]uint64, 1)
+  balances[acc] = balance
+  return Genesis{
+    Chain: name, Authority: authority, Balances: balances, Time: time.Now(),
+  }
+}
+
+func (g Genesis) Hash() Hash {
+  return NewHash(g)
+}
+  #+END_SRC
+
+- Signed genesis type :: The =SigGenesis= type embeds the =Genesis= type and
+  includes the genesis signature. After the genesis is created and signed by the
+  authority account, the genesis is immediately written to the genesis file
+  | ~Genesis~    | Embedded original genesis                 |
+  | ~Sig []byte~ | Digital signature of the original genesis |
+  #+BEGIN_SRC go
+type SigGenesis struct {
+  Genesis
+  Sig []byte `json:"sig"`
+}
+
+func NewSigGenesis(gen Genesis, sig []byte) SigGenesis {
+  return SigGenesis{Genesis: gen, Sig: sig}
+}
+
+func (g SigGenesis) Hash() Hash {
+  return NewHash(g)
+}
+  #+END_SRC
+
+*** ECDSA signing and verification of genesis
+
+This blockchain uses the Elliptic Curve Digital Signature Algorithm (ECDSA) for
+signing and verification of the signed genesis. Specifically, the Secp256k1
+elliptic curve is used for signing and verification of the genesis
+
+- Secp256k1 sign genesis :: The genesis signing process requires the
+  owner-provided password and is performed from the authority account. The
+  genesis signing process
+  - Produce the Keccak256 hash of the genesis
+  - Sign the Keccak256 hash of the genesis using the ECDSA algorithm on the
+    Secp256k1 elliptic curve
+  - Construct the signed genesis by adding the produced digital signature to
+    the original genesis
+  #+BEGIN_SRC go
+func (a Account) SignGen(gen Genesis) (SigGenesis, error) {
+  hash := gen.Hash().Bytes()
+  sig, err := ecc.SignBytes(a.prv, hash, ecc.LowerS | ecc.RecID)
+  if err != nil {
+    return SigGenesis{}, err
+  }
+  sgen := NewSigGenesis(gen, sig)
+  return sgen, nil
+}
+  #+END_SRC
+
+- Secp256k1 verify genesis :: The genesis verification process does not require
+  any external information like the owner-provided password. The signed genesis
+  instance contains all the necessary information to verify the signature of the
+  signed genesis. The genesis verification process
+  - Recover the public key from the hash of the original embedded genesis and
+    the genesis signature
+  - Derive the account address from the recovered public key
+  - If the derived account address is equal to the account address of the
+    authority account that signed the genesis, then the genesis signature is
+    valid
+  #+BEGIN_SRC go
+func VerifyGen(gen SigGenesis) (bool, error) {
+  hash := gen.Genesis.Hash().Bytes()
+  pub, err := ecc.RecoverPubkey("P-256k1", hash, gen.Sig)
+  if err != nil {
+    return false, err
+  }
+  acc := NewAddress(pub)
+  return acc == Address(gen.Authority), nil
+}
+  #+END_SRC
+
+*** Persistence and re-creation of genesis
+
+- Persist genesis :: The genesis persistence process
+  - Encode the signed genesis
+  - Persist the encoded and signed genesis to a file
+  #+BEGIN_SRC go
+func (g SigGenesis) Write(dir string) error {
+  jgen, err := json.Marshal(g)
+  if err != nil {
+    return err
+  }
+  err = os.MkdirAll(dir, 0700)
+  if err != nil {
+    return err
+  }
+  path := filepath.Join(dir, genesisFile)
+  return os.WriteFile(path, jgen, 0600)
+}
+  #+END_SRC
+
+The structure of the persisted and signed genesis
+#+BEGIN_SRC json
+{
+  "chain": "blockchain",
+  "authority": "3f884151ac3a02bf6e157ff6ff6b71df27fdd93e7210429da7e35c041eaf5739",
+  "balances": {
+    "1e99b05ea4c43c1b928b0f2b028ea099bb72fcb624dfa5bbbd99128f5e670946": 1000
+  },
+  "time": "2024-09-29T17:08:51.402870312+02:00",
+  "sig": "a4y0h8GgMnWKvXWjh6C0EzznHyd6tNs4H1fL6OG6nOt5ExHrtRZvb8b8GSqHXQjETKmkVk73X3pYNjnwcGEltgE="
+}
+#+END_SRC
+
+- Re-create genesis :: The genesis re-creation process
+  - Read the encoded and signed genesis from a file
+  - Decode the signed genesis
+  #+BEGIN_SRC go
+func ReadGenesis(dir string) (SigGenesis, error) {
+  path := filepath.Join(dir, genesisFile)
+  jgen, err := os.ReadFile(path)
+  if err != nil {
+    return SigGenesis{}, err
+  }
+  var gen SigGenesis
+  err = json.Unmarshal(jgen, &gen)
+  return gen, err
+}
+  #+END_SRC
+
+*** Block and signed block types
+
+The implementation makes distinction between the =Block= type that contains the
+block number, the parent hash, and the list of validated transactions; and the
+=SigBlock= type that also includes the signature of the block by the authority
+account. Most of the blockchain components work exclusively with the =SigBlock=
+type
+
+- Block type :: The =Block= type contains the block number, the hash of the
+  parent block, the list of validated transactions, the Merkle tree constructed
+  from the list of transactions, the Merkle root of the list of transactions,
+  the creation time of the block. The Merkle tree is constructed from the list
+  of transactions when a new block is created. The first element of the array
+  representation of the Merkle tree is the Merkle root used to verify the
+  inclusion of transactions into the list of transactions of a block by applying
+  the Merkle verify algorithm
+  | ~Number uint64~     | Block number             |
+  | ~Parent Hash~       | Parent hash              |
+  | ~Txs []SigTx~       | List of transactions     |
+  | ~merkleTree []Hash~ | Transactions Merkle tree |
+  | ~MerkleRoot Hash~   | Transactions Merkle root |
+  | ~Time time.Time~    | Creation time            |
+  #+BEGIN_SRC go
+type Block struct {
+  Number uint64 `json:"number"`
+  Parent Hash `json:"parent"`
+  Txs []SigTx `json:"txs"`
+  merkleTree []Hash
+  MerkleRoot Hash `json:"merkleRoot"`
+  Time time.Time `json:"time"`
+}
+
+func NewBlock(number uint64, parent Hash, txs []SigTx) (Block, error) {
+  merkleTree, err := MerkleHash(txs, TxHash, TxPairHash)
+  if err != nil {
+    return Block{}, err
+  }
+  blk := Block{
+    Number: number, Parent: parent, Txs: txs,
+    merkleTree: merkleTree, MerkleRoot: merkleTree[0],
+    Time: time.Now(),
+  }
+  return blk, nil
+}
+
+func (b Block) Hash() Hash {
+  return NewHash(b)
+}
+  #+END_SRC
+
+- Signed block type :: The =SigBlock= type embeds the =Block= type and includes
+  the block signature signed by the authority account. The string representation
+  of the signed block is defined to present the block to the end user
+  | ~Block~      | Embedded original block                 |
+  | ~Sig []byte~ | Digital signature of the original block |
+  #+BEGIN_SRC go
+type SigBlock struct {
+  Block
+  Sig []byte `json:"sig"`
+}
+
+func NewSigBlock(blk Block, sig []byte) SigBlock {
+  return SigBlock{Block: blk, Sig: sig}
+}
+
+func (b SigBlock) Hash() Hash {
+  return NewHash(b)
+}
+
+func (b SigBlock) String() string {
+  var bld strings.Builder
+  bld.WriteString(
+    fmt.Sprintf(
+      "blk %7d: %.7s -> %.7s   mrk %.7s\n",
+      b.Number, b.Hash(), b.Parent, b.MerkleRoot,
+    ),
+  )
+  for _, tx := range b.Txs {
+    bld.WriteString(fmt.Sprintf("%v\n", tx))
+  }
+  return bld.String()
+}
+  #+END_SRC
+
+*** ECDSA signing and verification of blocks
+
+This blockchain uses the Elliptic Curve Digital Signature Algorithm (ECDSA) for
+signing and verification of the signed blocks. Specifically, the Secp256k1
+elliptic curve is used for for signing and verification of signed blocks
+
+- Secp256k1 sign block :: The block signing process requires the owner-provided
+  password and is performed from the authority account. The block signing
+  process
+  - Produce the Keccak256 hash of the block
+  - Sign the Keccak256 hash of the block using the ECDSA algorithm on the
+    Secp256k1 elliptic curve
+  - Construct a signed block by adding the produced digital signature to
+    the original block
+  #+BEGIN_SRC go
+func (a Account) SignBlock(blk Block) (SigBlock, error) {
+  hash := blk.Hash().Bytes()
+  sig, err := ecc.SignBytes(a.prv, hash, ecc.LowerS | ecc.RecID)
+  if err != nil {
+    return SigBlock{}, err
+  }
+  sblk := NewSigBlock(blk, sig)
+  return sblk, nil
+}
+  #+END_SRC
+
+- Secp256k1 verify block :: The block verification process does not require any
+  external information like the owner-provided password. The signed block
+  instance contains all the necessary information to verify the signed block.
+  The block verification process
+  - Recover the public key from the hash of the original embedded block and
+    the block signature
+  - Derive the account address from the recovered public key
+  - If the derived account address is equal to the account address of the
+    authority account that signed the block, then the block signature is valid
+  #+BEGIN_SRC go
+func VerifyBlock(blk SigBlock, authority Address) (bool, error) {
+  hash := blk.Block.Hash().Bytes()
+  pub, err := ecc.RecoverPubkey("P-256k1", hash, blk.Sig)
+  if err != nil {
+    return false, err
+  }
+  acc := NewAddress(pub)
+  return acc == authority, nil
+}
+  #+END_SRC
+
+*** Persistence and re-creation of blocks
+
+- Persist block :: The block persistence process
+  - Encode the signed block
+  - Append the encoded and signed block to the block store file
+  #+BEGIN_SRC go
+func (b SigBlock) Write(dir string) error {
+  path := filepath.Join(dir, blocksFile)
+  file, err := os.OpenFile(path, os.O_CREATE | os.O_APPEND | os.O_WRONLY, 0600)
+  if err != nil {
+    return err
+  }
+  defer file.Close()
+  return json.NewEncoder(file).Encode(b)
+}
+  #+END_SRC
+
+The structure of the persisted, encoded, and signed block in the block store
+#+BEGIN_SRC json
+{
+  "number": 1,
+  "parent": "59b2d5d2ac4ed6addf6264195c72f63d0b292d6031d8cfdcd25235d182e9a33b",
+  "txs": [
+    {
+      "from": "66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105",
+      "to": "0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba",
+      "value": 2,
+      "nonce": 1,
+      "time": "2024-11-09T10:27:12.871221439+01:00",
+      "sig": "V7WHwt0hOvpI+d6RJErDiO45zj3rzmrb3Yaf1YTVc+d1LUwQhdTtz3OKmvD02jtVkG+DQeUYH9SaxcFd/wsl0gA="
+    },
+    {
+      "from": "0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba",
+      "to": "66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105",
+      "value": 1,
+      "nonce": 1,
+      "time": "2024-11-09T10:27:12.921031364+01:00",
+      "sig": "/V/bwvTnYWnU4GrYvDOp44P1rx6sQZl7b9NXiNefcopqqWOsMyZuUAo00hURL2BWs1xUw24U/7gAvHX+FLg2IwA="
+    }
+  ],
+  "merkleRoot": "c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394",
+  "time": "2024-11-09T10:27:15.961045888+01:00",
+  "sig": "NZ6RScmkRis2xhAECN6DaV8eL8FMZcxIJZXO8hFiQKBovkPB6g1wZsBmfbjhZRBUN61s5Pm0MTM+qDAdTl9YlQA="
+}
+#+END_SRC
+
+- Re-create block :: The =ReadBlocs= function returns the iterator over the
+  signed blocks from the block store file, the deferred function to close the
+  block store file, and a possible error if the blocks store is not accessible.
+  The iterator returns a signed block and a possible error if the block store is
+  corrupted. The block re-creation process
+  - Open the block store file
+  - Prepare the deferred function to close the block store file
+  - Create the iterator over the blocks in the block store
+  - For each block in the block store
+    - Scan the encoded signed block
+    - Decode the encoded signed block
+    - Yield the signed block to the client iterating over the blocks
+  - Return the block iterator and the deferred function to close the block store
+    file
+  #+BEGIN_SRC go
+func ReadBlocks(dir string) (
+  func(yield func(err error, blk SigBlock) bool), func(), error,
+) {
+  path := filepath.Join(dir, blocksFile)
+  file, err := os.Open(path)
+  if err != nil {
+    return nil, nil, err
+  }
+  close := func() {
+    file.Close()
+  }
+  blocks := func(yield func(err error, blk SigBlock) bool) {
+    sca := bufio.NewScanner(file)
+    more := true
+    for sca.Scan() && more {
+      err := sca.Err()
+      if err != nil {
+        yield(err, SigBlock{})
+        return
+      }
+      var blk SigBlock
+      err = json.Unmarshal(sca.Bytes(), &blk)
+      if err != nil {
+        more = yield(err, SigBlock{})
+        continue
+      }
+      more = yield(nil, blk)
+    }
+  }
+  return blocks, close, nil
+}
+  #+END_SRC
+
+*** gRPC =BlockSearch= method
+
+The gRPC =Block= service provides the =BlockSearch= method to locate validated
+and confirmed blocks on the local block store. The blocks that satisfy the
+search criteria are returned to the client through the gRPC server stream. The
+interface of the service
+#+BEGIN_SRC protobuf
+message BlockSearchReq {
+  uint64 Number = 1;
+  string Hash = 2;
+  string Parent = 3;
+}
+
+message BlockSearchRes {
+  bytes Block = 1;
+}
+
+service Block {
+  rpc BlockSearch(BlockSearchReq) returns (stream BlockSearchRes);
+}
+#+END_SRC
+
+The implementation of the =BlockSearch= method
+- Create the iterator over the blocks in the local block store
+- Defer closing the iterator
+- Iterate over each block in the local block store in order. For each block
+  - Send the first block that matches the requested block number, the block
+    hash prefix, or the parent hash prefix over the gRPC server stream and stop
+    the block search process
+#+BEGIN_SRC go
+func (s *BlockSrv) BlockSearch(
+  req *BlockSearchReq, stream grpc.ServerStreamingServer[BlockSearchRes],
+) error {
+  blocks, closeBlocks, err := chain.ReadBlocks(s.blockStoreDir)
+  if err != nil {
+    return status.Errorf(codes.NotFound, err.Error())
+  }
+  defer closeBlocks()
+  prefix := strings.HasPrefix
+  for err, blk := range blocks {
+    if err != nil {
+      return status.Errorf(codes.Internal, err.Error())
+    }
+    if req.Number != 0 && blk.Number == req.Number ||
+      len(req.Hash) > 0 && prefix(blk.Hash().String(), req.Hash) ||
+      len(req.Parent) > 0 && prefix(blk.Parent.String(), req.Parent) {
+      jblk, err := json.Marshal(blk)
+      if err != nil {
+        return status.Errorf(codes.Internal, err.Error())
+      }
+      res := &BlockSearchRes{Block: jblk}
+      err = stream.Send(res)
+      if err != nil {
+        return status.Errorf(codes.Internal, err.Error())
+      }
+      break
+    }
+  }
+  return nil
+}
+#+END_SRC
+
+** Testing and usage
+
+*** Testing genesis signing and verification
+
+The =TestGenesisWriteReadSignGenVerifyGen= testing process
+- Create and persist the authority account to sign the genesis and proposed
+  blocks
+- Create and persist the initial owner account to hold the initial balance of
+  the blockchain
+- Create and persist the genesis
+- Re-create the persisted genesis
+- Verify that the signature of the persisted genesis is valid
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run SignGenVerifyGen
+#+END_SRC
+
+*** Testing block signing and verification
+
+The =TestBlockSignBlockWriteReadVerifyBlock= testing process
+- Create and persist the genesis
+- Re-create the authority account from the genesis
+- Re-create the initial owner account from the genesis
+- Create and sign a transaction with the initial owner account
+- Create and sign a block with the authority account
+- Persist the signed block
+- Re-create the signed block
+- Verify that the signature of the signed block is valid
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run VerifyBlock
+#+END_SRC
+
+*** Testing gRPC =BlockSearch= method
+
+The =TestBlockSearch= testing process
+- Create and persist the genesis
+- Create the state from the genesis
+- Create several confirmed blocks on the state and on the local block store
+- Set up the gRPC server and client
+- Search by the block number
+  - Search blocks by the block number of an existing block
+  - Verify that the block is found
+  - Verify that the found block has the requested number
+- Search by the block hash
+  - Search blocks by the block hash of an existing block
+  - Verify that the block is found
+  - Verify that the found block has the requested hash
+- Search by the parent hash
+  - Search blocks by the parent hash of an existing block
+  - Verify that the block is found
+  - Verify that the found block has the requested parent hash
+#+BEGIN_SRC fish
+go test -v -cover -coverprofile=coverage.cov ./... -run BlockSearch
+#+END_SRC
+
+*** Using =block search= CLI command
+
+The gRPC =BlockSearch= method is exposed through the CLI. Sign and send
+transactions to the bootstrap node. Search confirmed blocks to verify that the
+blocks contain the signed and sent transactions
+- Initialize the blockchain by starting the bootstrap node with parameters for
+  the blockchain initial configuration
+  #+BEGIN_SRC fish
+set boot localhost:1122
+set authpass password
+set ownerpass password
+rm -rf .keystore* .blockstore* # cleanup if necessary
+./bcn node start --node $boot --bootstrap --authpass $authpass \
+  --ownerpass $ownerpass --balance 1000
+  #+END_SRC
+- Create and persist a new account to the local key store of the bootstrap node
+  (in a new terminal)
+  #+BEGIN_SRC fish
+./bcn account create --node $boot --ownerpass $ownerpass
+# acc 0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba
+  #+END_SRC
+- Define a shell function to create, sign, and send a transaction
+  #+BEGIN_SRC fish
+function txSignAndSend -a node from to value ownerpass
+  set tx (./bcn tx sign --node $node --from $from --to $to --value $value \
+    --ownerpass $ownerpass)
+  echo SigTx $tx
+  ./bcn tx send --node $node --sigtx $tx
+end
+  #+END_SRC
+- Create, sign, and send a transaction transferring funds between the initial
+  owner account from the genesis and the new account
+  #+BEGIN_SRC fish
+set acc1 66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105
+set acc2 0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba
+txSignAndSend $boot $acc1 $acc2 2 $ownerpass
+# SigTx {"from":"66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105","to":"0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba","value":2,"nonce":1,"time":"2024-11-09T10:27:12.871221439+01:00","sig":"V7WHwt0hOvpI+d6RJErDiO45zj3rzmrb3Yaf1YTVc+d1LUwQhdTtz3OKmvD02jtVkG+DQeUYH9SaxcFd/wsl0gA="}
+# tx 4312eb8f506a00c4f4f111ea8b318a871615115e5b1a49f14784c5f90a04baeb
+txSignAndSend $boot $acc2 $acc1 1 $ownerpass
+# SigTx {"from":"0a6c57d451f561d6baefe35bba47f8dd682b31da27f0dfdedc646648ea5d12ba","to":"66d614174909403746df7c3222cd74ca386995e4de11cfc99ca1efe548d33105","value":1,"nonce":1,"time":"2024-11-09T10:27:12.921031364+01:00","sig":"/V/bwvTnYWnU4GrYvDOp44P1rx6sQZl7b9NXiNefcopqqWOsMyZuUAo00hURL2BWs1xUw24U/7gAvHX+FLg2IwA="}
+# tx bd849704122be82ee588c2abfacb8e12fb5bac0916356babcdb2b1683bbc684e
+  #+END_SRC
+
+- Search blocks by the block number
+  #+BEGIN_SRC fish
+./bcn blocks search --node $boot --number 1
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# blk       1: 50de747 -> 59b2d5d   mrk c39f778
+# tx  4312eb8: 66d6141 -> 0a6c57d        2        1
+# tx  bd84970: 0a6c57d -> 66d6141        1        1
+  #+END_SRC
+- Search blocks by the block hash
+  #+BEGIN_SRC fish
+set blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+./bcn blocks search --node $boot --hash $blk
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# blk       1: 50de747 -> 59b2d5d   mrk c39f778
+# tx  4312eb8: 66d6141 -> 0a6c57d        2        1
+# tx  bd84970: 0a6c57d -> 66d6141        1        1
+  #+END_SRC
+- Search blocks by the parent hash
+  #+BEGIN_SRC fish
+set parent 59b2d5d
+./bcn blocks search --node $boot --parent $parent
+# blk 50de747a5fd220d8c847c2e7fe1e10d4c6915a555f04b9f843c1773a90b9b253
+# mrk c39f7787a0e1ad825964226031d1ede60f4a8546ce4a5f724321b22ffc3c7394
+# blk       1: 50de747 -> 59b2d5d   mrk c39f778
+# tx  4312eb8: 66d6141 -> 0a6c57d        2        1
+# tx  bd84970: 0a6c57d -> 66d6141        1        1
+  #+END_SRC

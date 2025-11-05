@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+option go_package = "./rpc";
+
+message PeerDiscoverReq {
+  string Peer = 1;
+}
+
+message PeerDiscoverRes {
+  repeated string Peers = 1;
+}
+
+message StreamSubscribeReq {
+  repeated uint64 EventTypes = 1;
+}
+
+message StreamSubscribeRes {
+  bytes Event = 1;
+}
+
+service Node {
+  rpc PeerDiscover(PeerDiscoverReq) returns (PeerDiscoverRes);
+  rpc StreamSubscribe(StreamSubscribeReq) returns (stream StreamSubscribeRes);
+}

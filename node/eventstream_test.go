@@ -1,0 +1,140 @@
+package node_test
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	chain2 "github.com/davidmovas/chain-forge/chain"
+	"github.com/davidmovas/chain-forge/node"
+	rpc2 "github.com/davidmovas/chain-forge/node/rpc"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+func createEventStream(
+	ctx context.Context, wg *sync.WaitGroup,
+) *node.EventStream {
+	evStream := node.NewEventStream(ctx, wg, 10)
+	wg.Add(1)
+	go evStream.StreamEvents()
+	return evStream
+}
+
+func subscribeAndVerifyEvents(
+	t *testing.T, ctx context.Context, conn grpc.ClientConnInterface,
+) {
+	// Create the gRPC node client
+	cln := rpc2.NewNodeClient(conn)
+	// Call the StreamSubscribe method to subscribe to the node event stream and
+	// establish the gRPC server stream of domain events
+	req := &rpc2.StreamSubscribeReq{EventTypes: []uint64{0}}
+	stream, err := cln.StreamSubscribe(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Define the expected events to receive after the successful block proposal
+	// and the successful block confirmation
+	expEvents := []chain2.Event{
+		{Type: chain2.EvBlock, Action: "validated", Body: nil},
+		{Type: chain2.EvTx, Action: "validated", Body: nil},
+		{Type: chain2.EvTx, Action: "validated", Body: nil},
+	}
+	// Start consuming domain events from the gRPC server stream of domain events
+	for i := range len(expEvents) {
+		// Receive a domain event
+		res, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Decode the received domain event
+		var got chain2.Event
+		err = json.Unmarshal(res.Event, &got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Verify that the type and the action of the domain event are correct
+		exp := expEvents[i]
+		if got.Type != exp.Type {
+			t.Errorf("invalid event type: expected %v, got %v", exp.Type, got.Type)
+		}
+		if got.Action != exp.Action {
+			t.Errorf(
+				"invalid event action: expected %v, got %v", exp.Action, got.Action,
+			)
+		}
+	}
+}
+
+func TestEventStream(t *testing.T) {
+	defer os.RemoveAll(bootKeyStoreDir)
+	defer os.RemoveAll(bootBlockStoreDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wg := new(sync.WaitGroup)
+	// Create the peer discovery without starting for the bootstrap node
+	bootPeerDisc := createPeerDiscovery(ctx, wg, true, false)
+	// Initialize the state on the bootstrap node by creating the genesis
+	bootState, err := createStateSync(ctx, bootPeerDisc, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create and start the block relay for the bootstrap node
+	bootBlkRelay := createBlockRelay(ctx, wg, bootPeerDisc)
+	// Re-create the authority account from the genesis to sign blocks
+	path := filepath.Join(bootKeyStoreDir, string(bootState.Authority()))
+	auth, err := chain2.ReadAccount(path, []byte(authPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create and start the block proposer on the bootstrap node
+	_ = createBlockProposer(ctx, wg, bootBlkRelay, auth, bootState)
+	// Create and start the event stream on the bootstrap node
+	evStream := createEventStream(ctx, wg)
+	// Start the gRPC server on the bootstrap node
+	grpcStartSvr(t, bootAddr, func(grpcSrv *grpc.Server) {
+		node := rpc2.NewNodeSrv(bootPeerDisc, evStream)
+		rpc2.RegisterNodeServer(grpcSrv, node)
+		tx := rpc2.NewTxSrv(
+			bootKeyStoreDir, bootBlockStoreDir, bootState.Pending, nil,
+		)
+		rpc2.RegisterTxServer(grpcSrv, tx)
+		blk := rpc2.NewBlockSrv(bootBlockStoreDir, evStream, bootState, bootBlkRelay)
+		rpc2.RegisterBlockServer(grpcSrv, blk)
+	})
+	// Wait for the gRPC server of the bootstrap node to start
+	time.Sleep(100 * time.Millisecond)
+	// Get the initial owner account and its balance from the genesis
+	gen, err := chain2.ReadGenesis(bootBlockStoreDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerAcc, _ := genesisAccount(gen)
+	// Re-create the initial owner account from the genesis
+	path = filepath.Join(bootKeyStoreDir, string(ownerAcc))
+	acc, err := chain2.ReadAccount(path, []byte(ownerPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sign and send several signed transactions to the bootstrap node
+	sendTxs(t, ctx, acc, []uint64{12, 34}, bootState.Pending, bootAddr)
+	// Set up a gRPC client connection with the bootstrap node
+	conn, err := grpc.NewClient(
+		bootAddr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Subscribe to the event stream of the bootstrap node and verify that
+	// received events are correct
+	subscribeAndVerifyEvents(t, ctx, conn)
+}
